@@ -1,14 +1,25 @@
 """
-PropFirmX — AI Debate Trading Terminal (Enhanced Version)
-รันด้วยคำสั่ง: streamlit run app.py
+PropFirmX — AI Debate Trading Terminal
+Gemini + Claude ทำงานร่วมกันแบบ Debate Pattern:
+  1) Gemini วิเคราะห์ก่อน (มุมมองตลาด/sentiment)
+  2) Claude ท้าทาย ตรวจสอบ และสรุปคำแนะนำสุดท้าย
+
+รันแบบ local:
+    pip install -r requirements.txt
+    streamlit run app.py
+    ใส่ key ใน .env (ดู .env.example)
+
+Deploy บน Streamlit Cloud:
+    ใส่ key ใน Settings > Secrets แทน .env
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
-import os
+import numpy as np
 import json
+import os
 from datetime import datetime
 from pydantic import BaseModel
 
@@ -17,7 +28,7 @@ from google.genai import types
 import anthropic
 
 # ============================================================
-# ⚙️ CONFIG & STATE
+# ⚙️ CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -28,6 +39,7 @@ st.set_page_config(
 )
 
 def get_secret(key: str) -> str:
+    """อ่าน key จาก Streamlit secrets ก่อน ถ้าไม่มีลอง env var (สำหรับ local + cloud)"""
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -38,11 +50,36 @@ def get_secret(key: str) -> str:
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 
+
+# ============================================================
+# 📊 SCHEMAS
+# ============================================================
+
+class GeminiOpinion(BaseModel):
+    market_sentiment: str       # มุมมองตลาดโดยรวม
+    initial_signal: str         # BUY / SELL / HOLD (มุมมองแรก)
+    key_observation: str        # สิ่งที่สังเกตเห็นจากข้อมูล
+    confidence: str             # สูง / กลาง / ต่ำ
+
+class ClaudeVerdict(BaseModel):
+    agrees_with_gemini: bool
+    final_signal: str           # BUY / SELL / HOLD
+    risk_level: str             # ต่ำ / กลาง / สูง
+    support_zone: str
+    resistance_zone: str
+    challenge_notes: str        # สิ่งที่ Claude ท้าทาย/แก้ไขจาก Gemini
+    final_reasoning: str        # เหตุผลสรุปสุดท้าย
+
+
+# ============================================================
+# 🔄 SESSION STATE
+# ============================================================
+
 defaults = {
     "active_ticker": "AAPL",
-    "timeframe": "1M (รายวัน)",
-    "debate_history": {}, # รูปแบบ: { "AAPL_1M": result_dict, ... }
-    "current_view_key": None
+    "timeframe": "6M (รายวัน)",
+    "debate_result": None,
+    "debate_running": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -55,30 +92,11 @@ tf_mapping = {
     "6M (รายวัน)": {"period": "6mo", "interval": "1d", "tv": "D"},
     "1Y (รายสัปดาห์)": {"period": "1y", "interval": "1wk", "tv": "W"},
 }
+current_tf = tf_mapping[st.session_state.timeframe]
+
 
 # ============================================================
-# 📊 SCHEMAS (อัปเกรด Trade Setup)
-# ============================================================
-
-class GeminiOpinion(BaseModel):
-    market_sentiment: str       # มุมมองตลาดโดยรวม
-    initial_signal: str         # BUY / SELL / HOLD 
-    key_observation: str        # สิ่งที่สังเกตเห็น (กราฟ + ข่าว)
-    momentum_strength: str      # แรงส่งของเทรนด์ (สูง/กลาง/ต่ำ)
-
-class ClaudeVerdict(BaseModel):
-    agrees_with_gemini: bool
-    final_signal: str           # BUY / SELL / HOLD
-    risk_level: str             # ต่ำ / กลาง / สูง
-    entry_zone: str             # ช่วงราคาเข้า
-    stop_loss: str              # จุดตัดขาดทุน
-    take_profit: str            # จุดทำกำไร
-    risk_reward_ratio: str      # เช่น 1:2 หรือ 1:3
-    challenge_notes: str        # การท้าทายความเห็น Gemini (มองมุมกลับ)
-    final_reasoning: str        # เหตุผลสรุปสุดท้าย
-
-# ============================================================
-# 🎨 THEME
+# 🎨 THEME — Dark Terminal, ส้มทองแดง+เขียวมรกตคู่ AI
 # ============================================================
 
 st.markdown("""
@@ -98,11 +116,13 @@ st.markdown("""
     --green: #4ade80;
     --red: #f87171;
 }
+
 html, body, [class*="css"] { font-family: 'JetBrains Mono', monospace; }
 .stApp { background: var(--bg); color: var(--text); }
+
 h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -0.02em; }
 
-/* Header & Banner */
+/* Header band */
 .term-header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 14px 22px; background: linear-gradient(90deg, var(--panel) 0%, var(--panel-2) 100%);
@@ -110,6 +130,9 @@ h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spa
 }
 .term-header .brand { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.3rem; color: var(--text); }
 .term-header .brand span { color: var(--verdict); }
+.term-header .tag { color: var(--text-dim); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; }
+
+/* AI vs AI banner */
 .vs-banner {
     display: flex; align-items: center; gap: 0; border-radius: 12px; overflow: hidden;
     border: 1px solid var(--border); margin-bottom: 20px;
@@ -121,34 +144,56 @@ h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spa
 .vs-gemini .vs-label { color: var(--gemini); }
 .vs-claude .vs-label { color: var(--claude); }
 .vs-sub { color: var(--text-dim); font-size: 0.72rem; margin-top: 2px; }
-.vs-divider { font-family: 'Space Grotesk', sans-serif; font-weight: 700; color: var(--verdict); padding: 0 4px; font-size: 1.1rem; }
+.vs-divider {
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; color: var(--verdict);
+    padding: 0 4px; font-size: 1.1rem;
+}
 
-/* Cards & Setup Box */
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; height: 100%; }
-.card-eyebrow { font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 8px; font-weight: 500; }
+/* Card */
+.card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 20px; margin-bottom: 14px;
+}
+.card-eyebrow {
+    font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim);
+    margin-bottom: 8px; font-weight: 500;
+}
 .card-title { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 1.05rem; margin-bottom: 10px; }
 
-.verdict-box { background: linear-gradient(135deg, rgba(201,168,106,0.10), rgba(201,168,106,0.02)); border: 1px solid rgba(201,168,106,0.35); border-radius: 12px; padding: 20px; }
-.verdict-signal { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.8rem; letter-spacing: 0.02em; }
-.signal-buy { color: var(--green); } .signal-sell { color: var(--red); } .signal-hold { color: var(--verdict); }
+/* Verdict box */
+.verdict-box {
+    background: linear-gradient(135deg, rgba(201,168,106,0.10), rgba(201,168,106,0.02));
+    border: 1px solid rgba(201,168,106,0.35); border-radius: 12px; padding: 20px;
+}
+.verdict-signal {
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.8rem;
+    letter-spacing: 0.02em;
+}
+.signal-buy { color: var(--green); }
+.signal-sell { color: var(--red); }
+.signal-hold { color: var(--verdict); }
 
-.setup-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 15px 0; }
-.setup-item { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
-.setup-label { font-size: 0.65rem; color: var(--text-dim); text-transform: uppercase; margin-bottom: 4px; }
-.setup-val { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 0.9rem; }
-.val-sl { color: var(--red); } .val-tp { color: var(--green); }
-
-.pill { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 500; border: 1px solid var(--border); color: var(--text-dim); }
+.pill {
+    display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.72rem;
+    font-weight: 500; border: 1px solid var(--border); color: var(--text-dim);
+}
 .pill-agree { color: var(--green); border-color: rgba(74,222,128,0.4); background: rgba(74,222,128,0.08); }
 .pill-disagree { color: var(--red); border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.08); }
+
 .divider-thin { border-top: 1px solid var(--border); margin: 14px 0; }
 
-.stButton > button { border-radius: 8px; border: 1px solid var(--border); font-family: 'Space Grotesk', sans-serif; font-weight: 600; transition: all 0.15s ease; }
+/* Streamlit element overrides */
+.stButton > button {
+    border-radius: 8px; border: 1px solid var(--border); font-family: 'Space Grotesk', sans-serif;
+    font-weight: 600; transition: all 0.15s ease;
+}
 .stButton > button:hover { border-color: var(--verdict); color: var(--verdict); }
 [data-testid="stSidebar"] { background: var(--panel); border-right: 1px solid var(--border); }
 .stTextInput input, .stSelectbox > div > div { background: var(--panel-2) !important; border-color: var(--border) !important; }
+[data-testid="stMetricValue"] { font-family: 'Space Grotesk', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
+
 
 # ============================================================
 # 🛠️ DATA HELPERS
@@ -161,16 +206,6 @@ def fetch_price_data(ticker: str, period: str, interval: str):
         df.columns = df.columns.get_level_values(0)
     return df.dropna()
 
-@st.cache_data(ttl=600)
-def fetch_latest_news(ticker: str) -> str:
-    try:
-        stock = yf.Ticker(ticker)
-        news = stock.news[:3]
-        if not news:
-            return "ไม่มีข้อมูลข่าวล่าสุด"
-        return "\n".join([f"- {n.get('title', 'Unknown')}" for n in news])
-    except Exception:
-        return "ไม่สามารถดึงข้อมูลข่าวได้ในขณะนี้"
 
 def compute_indicators(df: pd.DataFrame) -> dict:
     close = df["Close"]
@@ -192,39 +227,44 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     signal_line = macd_line.ewm(span=9).mean()
     macd_hist = float((macd_line - signal_line).iloc[-1])
 
+    vol_avg = float(volume.rolling(20).mean().iloc[-1]) if len(volume) >= 20 else float(volume.iloc[-1])
+    vol_now = float(volume.iloc[-1])
+    vol_ratio = round(vol_now / vol_avg, 2) if vol_avg > 0 else 1.0
+
     price = float(close.iloc[-1])
     prev = float(close.iloc[-2])
     change_pct = round((price - prev) / prev * 100, 2)
 
     return {
-        "price": round(price, 2), "change_pct": change_pct, "rsi": round(rsi, 2),
-        "ma20": round(ma20, 2), "bb_upper": round(bb_upper, 2), "bb_lower": round(bb_lower, 2),
-        "macd_hist": round(macd_hist, 4)
+        "price": round(price, 2),
+        "change_pct": change_pct,
+        "rsi": round(rsi, 2),
+        "ma20": round(ma20, 2),
+        "bb_upper": round(bb_upper, 2),
+        "bb_lower": round(bb_lower, 2),
+        "macd_hist": round(macd_hist, 4),
+        "vol_ratio": vol_ratio,
     }
 
+
 # ============================================================
-# 🤖 AI LOGIC (Persona + Strategy)
+# 🤖 STEP 1 — GEMINI: ความเห็นแรก
 # ============================================================
 
-def gemini_first_opinion(ticker: str, ind: dict, news: str) -> dict:
+def gemini_first_opinion(ticker: str, ind: dict) -> dict:
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
-    [Persona: The Aggressive Trend Follower]
-    คุณคือนักวิเคราะห์สายซิ่งที่ชอบตามน้ำ (Momentum Trader) คุณมองหาโอกาสทำกำไรเสมอ และมักมองโลกในแง่บวกถ้ามีสัญญานเชิงบวกแม้เพียงเล็กน้อย
-
-    วิเคราะห์หุ้น {ticker} จากข้อมูล:
+    คุณคือนักวิเคราะห์ตลาดที่มองภาพกว้างและจับ sentiment ตลาดได้ไว
+    วิเคราะห์หุ้น {ticker} จากข้อมูลทางเทคนิคนี้:
     - ราคา: ${ind['price']} ({ind['change_pct']:+}% วันนี้)
     - RSI(14): {ind['rsi']}
     - MA20: ${ind['ma20']}
     - Bollinger: บน ${ind['bb_upper']} / ล่าง ${ind['bb_lower']}
     - MACD Histogram: {ind['macd_hist']}
-    
-    พาดหัวข่าวล่าสุด:
-    {news}
+    - Volume Ratio: {ind['vol_ratio']}x ของค่าเฉลี่ย
 
-    หน้าที่:
-    ให้ความเห็นแบบกล้าได้กล้าเสีย ชี้จุดแข็งของกราฟหรือข่าว สนับสนุนให้เทรดถ้ามีโอกาส
-    ตอบเป็น JSON ที่สอดคล้องกับ Schema และใช้ภาษาไทย
+    ให้ความเห็นเบื้องต้นแบบนักวิเคราะห์ที่มองโอกาสและความเสี่ยงในตลาด
+    นี่เป็นความเห็น 'รอบแรก' เท่านั้น จะมีนักวิเคราะห์อีกคนมาท้าทายความเห็นนี้ต่อ
     """
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -232,39 +272,52 @@ def gemini_first_opinion(ticker: str, ind: dict, news: str) -> dict:
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=GeminiOpinion,
-            temperature=0.7
+            temperature=0.4,
+            system_instruction="ตอบเป็นภาษาไทย 100% กระชับ คมคาย ไม่ใช้ภาษาอังกฤษปนยกเว้นคำศัพท์เฉพาะทางการเงิน"
         )
     )
     return json.loads(response.text)
 
-def claude_challenge_and_verdict(ticker: str, ind: dict, news: str, gemini_opinion: dict) -> dict:
+
+# ============================================================
+# 🤖 STEP 2 — CLAUDE: ท้าทาย + สรุปคำตัดสินสุดท้าย
+# ============================================================
+
+def claude_challenge_and_verdict(ticker: str, ind: dict, gemini_opinion: dict) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    
-    prompt = f"""[Persona: The Strict Risk Manager]
-คุณคือผู้จัดการกองทุนสายอนุรักษ์นิยม คุณขี้ระแวง จับผิดเก่ง และให้ความสำคัญกับการปกป้องเงินทุน (Capital Preservation) ก่อนการทำกำไรเสมอ
 
-ข้อมูลหุ้น {ticker}: ราคา ${ind['price']} (RSI: {ind['rsi']}, MA20: ${ind['ma20']})
-ข่าวล่าสุด: {news}
+    prompt = f"""คุณคือนักวิเคราะห์ความเสี่ยงระดับสูงที่ตรวจทานความเห็นของนักวิเคราะห์คนอื่นอย่างเข้มงวด
 
-ความเห็นของนักวิเคราะห์สายซิ่ง (Gemini) ที่คุณต้องตรวจสอบ:
-- สัญญาณ: {gemini_opinion['initial_signal']}
-- มุมมอง: {gemini_opinion['market_sentiment']}
+ข้อมูลทางเทคนิคของหุ้น {ticker}:
+- ราคา: ${ind['price']} ({ind['change_pct']:+}% วันนี้)
+- RSI(14): {ind['rsi']}
+- MA20: ${ind['ma20']}
+- Bollinger: บน ${ind['bb_upper']} / ล่าง ${ind['bb_lower']}
+- MACD Histogram: {ind['macd_hist']}
+- Volume Ratio: {ind['vol_ratio']}x
+
+ความเห็นรอบแรกจากนักวิเคราะห์อีกคน (Gemini):
+- มุมมองตลาด: {gemini_opinion['market_sentiment']}
+- สัญญาณเบื้องต้น: {gemini_opinion['initial_signal']}
 - สิ่งที่สังเกตเห็น: {gemini_opinion['key_observation']}
+- ความมั่นใจ: {gemini_opinion['confidence']}
 
 หน้าที่ของคุณ:
-1. จับผิดความเห็นของ Gemini (เช่น กราฟอาจจะ Overbought หรือข่าวอาจจะเป็นกับดัก)
-2. ตัดสินใจให้สัญญาณสุดท้ายที่เน้นความปลอดภัย
-3. คำนวณ Trade Setup: จุดเข้า (Entry), จุดตัดขาดทุน (Stop Loss ควรต่ำกว่า MA20 หรือ BB_Lower), จุดทำกำไร (Take Profit), และ Risk:Reward (เช่น 1:2)
-ตอบเป็นภาษาไทยอย่างผู้เชี่ยวชาญ และดุดันต่อความเห็นของ Gemini เล็กน้อย"""
+1. ตรวจสอบว่าความเห็นนี้สมเหตุสมผลกับข้อมูลทางเทคนิคหรือไม่ ท้าทายจุดที่อ่อนหรือมองข้ามไป
+2. ให้สัญญาณสุดท้าย BUY/SELL/HOLD ที่อาจเหมือนหรือต่างจาก Gemini ก็ได้
+3. ระบุระดับความเสี่ยง แนวรับ-แนวต้าน
+4. อธิบายเหตุผลสรุปสุดท้ายอย่างตรงไปตรงมา
+
+ตอบเป็นภาษาไทยกระชับ ชัดเจน ไม่เกรงใจหากต้องแย้งความเห็นแรก"""
 
     response = client.messages.create(
-        model="claude-3-5-sonnet-latest",
-        max_tokens=1200,
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
         system="คุณตอบกลับเป็น JSON ที่ตรงกับ schema เท่านั้น ห้ามมีข้อความอื่นนอก JSON",
         messages=[{"role": "user", "content": prompt}],
         tools=[{
             "name": "submit_verdict",
-            "description": "ส่งคำตัดสินและแผนการเทรดสุดท้าย",
+            "description": "ส่งคำตัดสินสุดท้ายหลังตรวจทานความเห็นของ Gemini",
             "input_schema": ClaudeVerdict.model_json_schema()
         }],
         tool_choice={"type": "tool", "name": "submit_verdict"}
@@ -275,68 +328,67 @@ def claude_challenge_and_verdict(ticker: str, ind: dict, news: str, gemini_opini
             return block.input
     raise ValueError("Claude ไม่ได้ส่งคำตัดสินกลับมา")
 
-def run_debate(ticker: str, ind: dict, news: str) -> dict:
-    gemini_op = gemini_first_opinion(ticker, ind, news)
-    claude_v = claude_challenge_and_verdict(ticker, ind, news, gemini_op)
-    return {"gemini": gemini_op, "claude": claude_v, "indicators": ind, "news": news, "ticker": ticker, "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+def run_debate(ticker: str, ind: dict) -> dict:
+    gemini_op = gemini_first_opinion(ticker, ind)
+    claude_v = claude_challenge_and_verdict(ticker, ind, gemini_op)
+    return {"gemini": gemini_op, "claude": claude_v, "indicators": ind, "ticker": ticker}
+
 
 # ============================================================
-# 📌 SIDEBAR & HISTORY
+# 📌 SIDEBAR
 # ============================================================
 
 with st.sidebar:
     st.markdown("<h3 style='color:#c9a86a;'>◆ PropFirmX</h3>", unsafe_allow_html=True)
-    st.caption("AI Debate Terminal (Enhanced)")
+    st.caption("AI Debate Terminal — Gemini × Claude")
     st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
     search_ticker = st.text_input("Ticker", value=st.session_state.active_ticker).upper()
-    selected_tf = st.selectbox("Timeframe", list(tf_mapping.keys()), index=list(tf_mapping.keys()).index(st.session_state.timeframe))
-    
-    if search_ticker != st.session_state.active_ticker or selected_tf != st.session_state.timeframe:
+    if search_ticker != st.session_state.active_ticker:
         st.session_state.active_ticker = search_ticker
+        st.session_state.debate_result = None
+
+    selected_tf = st.selectbox("Timeframe", list(tf_mapping.keys()),
+                                index=list(tf_mapping.keys()).index(st.session_state.timeframe))
+    if selected_tf != st.session_state.timeframe:
         st.session_state.timeframe = selected_tf
-        st.session_state.current_view_key = None
+        st.rerun()
+
+    st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
     if not GEMINI_API_KEY or not ANTHROPIC_API_KEY:
-        st.warning("⚠️ ขาด API Key")
-    
-    run_clicked = st.button("▶ เริ่ม AI Debate", type="primary", use_container_width=True, disabled=not (GEMINI_API_KEY and ANTHROPIC_API_KEY))
-
-    # --- History Log ---
-    st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:0.8rem; color:#7b8494; font-weight:600; margin-bottom:10px;'>📝 ประวัติการวิเคราะห์ (History)</div>", unsafe_allow_html=True)
-    
-    if st.session_state.debate_history:
-        for key in reversed(list(st.session_state.debate_history.keys())):
-            hist_data = st.session_state.debate_history[key]
-            lbl = f"[{hist_data['claude']['final_signal']}] {hist_data['ticker']} ({hist_data['time'][-5:]})"
-            if st.button(lbl, key=f"hist_{key}", use_container_width=True):
-                st.session_state.current_view_key = key
-                st.session_state.active_ticker = hist_data['ticker']
+        st.warning("⚠️ ยังไม่ได้ตั้งค่า API Key ครบ\n\nดู .env.example หรือ Streamlit Secrets")
     else:
-        st.caption("ยังไม่มีประวัติการวิเคราะห์")
+        st.success("✅ API Keys พร้อมใช้งาน")
 
-current_tf = tf_mapping[st.session_state.timeframe]
-state_key = f"{st.session_state.active_ticker}_{st.session_state.timeframe}"
+    run_clicked = st.button("▶ เริ่ม AI Debate", type="primary", use_container_width=True,
+                             disabled=not (GEMINI_API_KEY and ANTHROPIC_API_KEY))
+
 
 # ============================================================
-# 📌 HEADER & CHART
+# 📌 HEADER
 # ============================================================
-
-ticker = st.session_state.active_ticker
 
 st.markdown(f"""
 <div class="term-header">
     <div>
         <div class="brand">PROP<span>FIRM</span>X</div>
-        <div class="tag">Debate + Risk Management</div>
+        <div class="tag">AI Debate Trading Terminal</div>
     </div>
-    <div class="tag">{datetime.now().strftime('%Y-%m-%d')} · {ticker} · {st.session_state.timeframe}</div>
+    <div class="tag">{datetime.now().strftime('%Y-%m-%d %H:%M')} · {st.session_state.active_ticker}</div>
 </div>
 """, unsafe_allow_html=True)
 
+
+# ============================================================
+# 📌 CHART
+# ============================================================
+
+ticker = st.session_state.active_ticker
+
 tradingview_html = f"""
-<div class="tradingview-widget-container" style="height:350px;width:100%">
+<div class="tradingview-widget-container" style="height:380px;width:100%">
   <div id="tv_chart" style="height:100%;width:100%"></div>
   <script src="https://s3.tradingview.com/tv.js"></script>
   <script>
@@ -350,127 +402,104 @@ tradingview_html = f"""
   </script>
 </div>
 """
-components.html(tradingview_html, height=360)
+components.html(tradingview_html, height=390)
 
 try:
     df = fetch_price_data(ticker, current_tf["period"], current_tf["interval"])
     ind = compute_indicators(df)
-    news_text = fetch_latest_news(ticker)
 except Exception as e:
     st.error(f"ดึงข้อมูลไม่ได้: {e}")
-    ind = {"price": 0, "change_pct": 0, "rsi": 50, "ma20": 0, "bb_upper": 0, "bb_lower": 0, "macd_hist": 0}
-    news_text = "ไม่มีข้อมูลข่าว"
+    ind = {"price": 0, "change_pct": 0, "rsi": 50, "ma20": 0, "bb_upper": 0, "bb_lower": 0, "macd_hist": 0, "vol_ratio": 1}
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("ราคาปัจจุบัน", f"${ind['price']:,.2f}", f"{ind['change_pct']:+.2f}%")
+m1.metric("ราคา", f"${ind['price']:,.2f}", f"{ind['change_pct']:+.2f}%")
 m2.metric("RSI(14)", f"{ind['rsi']:.1f}")
-m3.metric("MA(20)", f"${ind['ma20']:,.2f}")
-m4.metric("MACD Hist", f"{ind['macd_hist']:.2f}")
-
-with st.expander("📰 พาดหัวข่าวล่าสุด (News Sentiment)"):
-    st.text(news_text)
+m3.metric("MA20", f"${ind['ma20']:,.2f}")
+m4.metric("Volume", f"{ind['vol_ratio']:.2f}x")
 
 st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
+
 # ============================================================
-# 📌 DEBATE EXECUTION & RENDER
+# 📌 AI DEBATE EXECUTION
 # ============================================================
 
 st.markdown("""
 <div class="vs-banner">
     <div class="vs-side vs-gemini">
-        <div class="vs-label">◷ GEMINI (The Aggressive)</div>
-        <div class="vs-sub">มองหาโอกาส · เน้นโมเมนตัม</div>
+        <div class="vs-label">◷ GEMINI</div>
+        <div class="vs-sub">ความเห็นรอบแรก · มุมมองตลาด</div>
     </div>
     <div class="vs-divider">⟷</div>
     <div class="vs-side vs-claude">
-        <div class="vs-label">◈ CLAUDE (The Risk Manager)</div>
-        <div class="vs-sub">ปกป้องทุน · กำหนด Trade Setup</div>
+        <div class="vs-label">◈ CLAUDE</div>
+        <div class="vs-sub">ท้าทาย · ตรวจสอบ · ตัดสิน</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 if run_clicked:
-    with st.spinner(f"กำลังวิเคราะห์ข้อมูล + ข่าว สำหรับ {ticker}..."):
+    with st.spinner("Gemini กำลังวิเคราะห์รอบแรก..."):
         try:
-            res = run_debate(ticker, ind, news_text)
-            st.session_state.debate_history[state_key] = res
-            st.session_state.current_view_key = state_key
+            result = run_debate(ticker, ind)
+            st.session_state.debate_result = result
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"เกิดข้อผิดพลาดระหว่าง AI Debate: {e}")
 
-# เลือกข้อมูลที่จะแสดง: จากที่รันล่าสุด หรือจาก History
-active_result = None
-if st.session_state.current_view_key and st.session_state.current_view_key in st.session_state.debate_history:
-    active_result = st.session_state.debate_history[st.session_state.current_view_key]
+result = st.session_state.debate_result
 
-if active_result:
+if result:
     col_g, col_c = st.columns(2)
 
     with col_g:
-        g = active_result["gemini"]
+        g = result["gemini"]
         st.markdown(f"""
         <div class="card">
-            <div class="card-eyebrow" style="color:#4fb3a9;">GEMINI · มองเกมบุก</div>
+            <div class="card-eyebrow" style="color:#4fb3a9;">GEMINI · ความเห็นแรก</div>
             <div class="card-title">{g['initial_signal']}</div>
             <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">มุมมองตลาด</p>
             <p style="font-size:0.9rem;">{g['market_sentiment']}</p>
-            <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px; margin-top:12px;">จุดที่น่าสนใจ (Price Action + ข่าว)</p>
+            <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px; margin-top:12px;">สิ่งที่สังเกตเห็น</p>
             <p style="font-size:0.9rem;">{g['key_observation']}</p>
             <div class="divider-thin"></div>
-            <span class="pill">แรงส่ง: {g['momentum_strength']}</span>
+            <span class="pill">ความมั่นใจ: {g['confidence']}</span>
         </div>
         """, unsafe_allow_html=True)
 
     with col_c:
-        c = active_result["claude"]
+        c = result["claude"]
         agree_class = "pill-agree" if c["agrees_with_gemini"] else "pill-disagree"
-        agree_text = "เห็นด้วยกับ Gemini" if c["agrees_with_gemini"] else "ขัดแย้งกับ Gemini"
+        agree_text = "เห็นด้วยกับ Gemini" if c["agrees_with_gemini"] else "ไม่เห็นด้วยกับ Gemini"
         st.markdown(f"""
         <div class="card">
-            <div class="card-eyebrow" style="color:#d97757;">CLAUDE · จับผิด & คุมความเสี่ยง</div>
+            <div class="card-eyebrow" style="color:#d97757;">CLAUDE · ท้าทาย & ตัดสิน</div>
             <div class="card-title">{c['final_signal']}</div>
-            <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">ข้อทักท้วง (Challenge)</p>
+            <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">ท้าทายความเห็นแรก</p>
             <p style="font-size:0.9rem;">{c['challenge_notes']}</p>
             <div class="divider-thin"></div>
             <span class="pill {agree_class}">{agree_text}</span>
-            <span class="pill">ระดับความเสี่ยง: {c['risk_level']}</span>
+            <span class="pill">เสี่ยง: {c['risk_level']}</span>
         </div>
         """, unsafe_allow_html=True)
 
-    signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(c["final_signal"].upper(), "signal-hold")
+    signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(
+        c["final_signal"].upper(), "signal-hold"
+    )
 
     st.markdown(f"""
     <div class="verdict-box">
-        <div class="card-eyebrow" style="color:#c9a86a;">⚖ บทสรุป & TRADE SETUP</div>
+        <div class="card-eyebrow" style="color:#c9a86a;">⚖ คำตัดสินสุดท้าย</div>
         <div class="verdict-signal {signal_class}">{c['final_signal']}</div>
-        
-        <div class="setup-grid">
-            <div class="setup-item">
-                <div class="setup-label">Entry Zone</div>
-                <div class="setup-val">{c['entry_zone']}</div>
-            </div>
-            <div class="setup-item">
-                <div class="setup-label">Stop Loss</div>
-                <div class="setup-val val-sl">{c['stop_loss']}</div>
-            </div>
-            <div class="setup-item">
-                <div class="setup-label">Take Profit</div>
-                <div class="setup-val val-tp">{c['take_profit']}</div>
-            </div>
-            <div class="setup-item">
-                <div class="setup-label">Risk:Reward</div>
-                <div class="setup-val">{c['risk_reward_ratio']}</div>
-            </div>
-        </div>
-
         <div class="divider-thin"></div>
-        <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">เหตุผลสรุปสุดท้ายจาก Risk Manager</p>
+        <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">แนวรับ / แนวต้าน</p>
+        <p style="font-size:0.95rem;">🛡 {c['support_zone']} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c['resistance_zone']}</p>
+        <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px; margin-top:14px;">เหตุผลสรุปสุดท้าย</p>
         <p style="font-size:0.95rem;">{c['final_reasoning']}</p>
     </div>
     """, unsafe_allow_html=True)
-
 else:
-    st.info("ระบุ Ticker ที่ต้องการแล้วกด **▶ เริ่ม AI Debate** ที่แถบด้านซ้าย")
+    st.info("กด **▶ เริ่ม AI Debate** ที่แถบด้านซ้ายเพื่อให้ Gemini และ Claude ช่วยกันวิเคราะห์หุ้นนี้")
 
-st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>ระบบเทรดนี้สร้างขึ้นเพื่อทดสอบแนวคิด AI Debate และการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน (Not Financial Advice)</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>"
+            "ข้อมูลนี้ใช้เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน"
+            "</div>", unsafe_allow_html=True)
