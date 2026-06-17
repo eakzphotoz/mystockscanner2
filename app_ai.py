@@ -263,7 +263,7 @@ def gemini_first_opinion(ticker: str, ind: dict) -> dict:
     นี่เป็นความเห็น 'รอบแรก' เท่านั้น จะมีนักวิเคราะห์สายคุมความเสี่ยงมาตรวจสอบคุณอีกที
     """
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -302,7 +302,7 @@ def claude_challenge_and_verdict(ticker: str, ind: dict, gemini_opinion: dict) -
 ตอบเป็นภาษาไทยกระชับ ชัดเจน ไม่เกรงใจหากต้องแย้งความเห็นแรก"""
 
     response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         system="คุณตอบกลับเป็น JSON ที่ตรงกับ schema เท่านั้น ห้ามมีข้อความอื่น",
         messages=[{"role": "user", "content": prompt}],
