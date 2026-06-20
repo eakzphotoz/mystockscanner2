@@ -69,6 +69,11 @@ class ClaudeVerdict(BaseModel):
     resistance_zone: str
     challenge_notes: str        # สิ่งที่ Claude ท้าทาย/แก้ไขจาก Gemini
     final_reasoning: str        # เหตุผลสรุปสุดท้าย
+    action_summary: str         # สรุปสั้น 1-2 บรรทัด: ทำอะไร เพราะอะไร (ภาษาคนทั่วไปเข้าใจง่าย)
+    entry_price: str            # ราคา/ช่วงราคาที่ควรเข้าซื้อ (ถ้า HOLD/SELL ให้ระบุ "-" หรือเงื่อนไข)
+    stop_loss: str              # ราคาที่ควรตัดขาดทุน
+    take_profit: str            # ราคาเป้าหมายที่ควรพิจารณาขายทำกำไร
+    position_sizing_note: str   # คำแนะนำสั้นๆเรื่องสัดส่วนการลงทุน/ความเสี่ยงที่รับได้
 
 
 # ============================================================
@@ -223,6 +228,30 @@ h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spa
 .badge-vol { background: rgba(201,168,106,0.12); color: var(--verdict); border: 1px solid rgba(201,168,106,0.3); }
 
 [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; }
+
+/* Quick action banner */
+.action-banner {
+    border-radius: 12px; padding: 16px 22px; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 16px; border: 1px solid;
+}
+.action-banner.buy { background: linear-gradient(90deg, rgba(74,222,128,0.14), rgba(74,222,128,0.03)); border-color: rgba(74,222,128,0.4); }
+.action-banner.sell { background: linear-gradient(90deg, rgba(248,113,113,0.14), rgba(248,113,113,0.03)); border-color: rgba(248,113,113,0.4); }
+.action-banner.hold { background: linear-gradient(90deg, rgba(201,168,106,0.14), rgba(201,168,106,0.03)); border-color: rgba(201,168,106,0.4); }
+.action-banner .icon { font-size: 1.8rem; }
+.action-banner .label { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.1rem; }
+.action-banner .desc { color: var(--text-dim); font-size: 0.88rem; margin-top: 2px; }
+
+/* Action plan grid */
+.plan-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+.plan-cell {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px;
+}
+.plan-cell .plan-label { font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.plan-cell .plan-value { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 1rem; }
+.plan-cell.entry .plan-value { color: var(--gemini); }
+.plan-cell.stop .plan-value { color: var(--red); }
+.plan-cell.target .plan-value { color: var(--green); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -388,7 +417,7 @@ def gemini_first_opinion(ticker: str, ind: dict) -> dict:
     นี่เป็นความเห็น 'รอบแรก' เท่านั้น จะมีนักวิเคราะห์อีกคนมาท้าทายความเห็นนี้ต่อ
     """
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -428,13 +457,21 @@ def claude_challenge_and_verdict(ticker: str, ind: dict, gemini_opinion: dict) -
 2. ให้สัญญาณสุดท้าย BUY/SELL/HOLD ที่อาจเหมือนหรือต่างจาก Gemini ก็ได้
 3. ระบุระดับความเสี่ยง แนวรับ-แนวต้าน
 4. อธิบายเหตุผลสรุปสุดท้ายอย่างตรงไปตรงมา
+5. สรุป Action Plan ที่นำไปใช้ได้จริง:
+   - action_summary: สรุป 1-2 บรรทัดสั้นๆว่าควรทำอะไรและเพราะอะไร ให้คนทั่วไปอ่านแล้วเข้าใจทันที
+   - entry_price: ราคาหรือช่วงราคาที่เหมาะเข้าซื้อ (ถ้าแนะนำ HOLD/SELL ให้ใส่เงื่อนไขที่จะกลับมาซื้อ หรือ "-" ถ้าไม่เกี่ยวข้อง)
+   - stop_loss: ราคาที่ควรตัดขาดทุนถ้าผิดทาง
+   - take_profit: ราคาเป้าหมายที่ควรพิจารณาขายทำกำไร
+   - position_sizing_note: คำแนะนำสั้นๆเรื่องสัดส่วนการลงทุนหรือการบริหารความเสี่ยง (เช่น ไม่ควรเกินกี่% ของพอร์ต)
+
+สำคัญ: challenge_notes และ final_reasoning ให้เขียนกระชับ ไม่เกิน 3-4 บรรทัดต่อ field เพื่อให้ตอบ JSON ได้ครบทุก field
 
 ตอบเป็นภาษาไทยกระชับ ชัดเจน ไม่เกรงใจหากต้องแย้งความเห็นแรก"""
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1000,
-        system="คุณตอบกลับเป็น JSON ที่ตรงกับ schema เท่านั้น ห้ามมีข้อความอื่นนอก JSON",
+        max_tokens=2048,
+        system="คุณตอบกลับเป็น JSON ที่ตรงกับ schema เท่านั้น ห้ามมีข้อความอื่นนอก JSON ตอบให้ครบทุก field แบบกระชับ ไม่ต้องอธิบายยาวเกินจำเป็น",
         messages=[{"role": "user", "content": prompt}],
         tools=[{
             "name": "submit_verdict",
@@ -628,6 +665,22 @@ if run_clicked:
 result = st.session_state.debate_result
 
 if result:
+    c = result["claude"]
+    signal_upper = c.get("final_signal", "HOLD").upper()
+    banner_class = "buy" if signal_upper == "BUY" else "sell" if signal_upper == "SELL" else "hold"
+    icon = "🟢" if banner_class == "buy" else "🔴" if banner_class == "sell" else "🟡"
+    action_label = {"buy": "ซื้อ", "sell": "ขาย", "hold": "ถือต่อ"}[banner_class]
+
+    st.markdown(f"""
+    <div class="action-banner {banner_class}">
+        <div class="icon">{icon}</div>
+        <div>
+            <div class="label">คำแนะนำ: {action_label} ({c.get('final_signal', '-')})</div>
+            <div class="desc">{c.get('action_summary', '')}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     col_g, col_c = st.columns(2)
 
     with col_g:
@@ -635,45 +688,61 @@ if result:
         st.markdown(f"""
         <div class="card">
             <div class="card-eyebrow" style="color:#4fb3a9;">GEMINI · ความเห็นแรก</div>
-            <div class="card-title">{g['initial_signal']}</div>
+            <div class="card-title">{g.get('initial_signal', '-')}</div>
             <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">มุมมองตลาด</p>
-            <p style="font-size:0.9rem;">{g['market_sentiment']}</p>
+            <p style="font-size:0.9rem;">{g.get('market_sentiment', '-')}</p>
             <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px; margin-top:12px;">สิ่งที่สังเกตเห็น</p>
-            <p style="font-size:0.9rem;">{g['key_observation']}</p>
+            <p style="font-size:0.9rem;">{g.get('key_observation', '-')}</p>
             <div class="divider-thin"></div>
-            <span class="pill">ความมั่นใจ: {g['confidence']}</span>
+            <span class="pill">ความมั่นใจ: {g.get('confidence', '-')}</span>
         </div>
         """, unsafe_allow_html=True)
 
     with col_c:
-        c = result["claude"]
-        agree_class = "pill-agree" if c["agrees_with_gemini"] else "pill-disagree"
-        agree_text = "เห็นด้วยกับ Gemini" if c["agrees_with_gemini"] else "ไม่เห็นด้วยกับ Gemini"
+        agree_class = "pill-agree" if c.get("agrees_with_gemini") else "pill-disagree"
+        agree_text = "เห็นด้วยกับ Gemini" if c.get("agrees_with_gemini") else "ไม่เห็นด้วยกับ Gemini"
         st.markdown(f"""
         <div class="card">
             <div class="card-eyebrow" style="color:#d97757;">CLAUDE · ท้าทาย & ตัดสิน</div>
-            <div class="card-title">{c['final_signal']}</div>
+            <div class="card-title">{c.get('final_signal', '-')}</div>
             <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">ท้าทายความเห็นแรก</p>
-            <p style="font-size:0.9rem;">{c['challenge_notes']}</p>
+            <p style="font-size:0.9rem;">{c.get('challenge_notes', '-')}</p>
             <div class="divider-thin"></div>
             <span class="pill {agree_class}">{agree_text}</span>
-            <span class="pill">เสี่ยง: {c['risk_level']}</span>
+            <span class="pill">เสี่ยง: {c.get('risk_level', '-')}</span>
         </div>
         """, unsafe_allow_html=True)
 
     signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(
-        c["final_signal"].upper(), "signal-hold"
+        c.get("final_signal", "HOLD").upper(), "signal-hold"
     )
 
     st.markdown(f"""
     <div class="verdict-box">
         <div class="card-eyebrow" style="color:#c9a86a;">⚖ คำตัดสินสุดท้าย</div>
-        <div class="verdict-signal {signal_class}">{c['final_signal']}</div>
+        <div class="verdict-signal {signal_class}">{c.get('final_signal', '-')}</div>
         <div class="divider-thin"></div>
         <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">แนวรับ / แนวต้าน</p>
-        <p style="font-size:0.95rem;">🛡 {c['support_zone']} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c['resistance_zone']}</p>
+        <p style="font-size:0.95rem;">🛡 {c.get('support_zone', '-')} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c.get('resistance_zone', '-')}</p>
         <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px; margin-top:14px;">เหตุผลสรุปสุดท้าย</p>
-        <p style="font-size:0.95rem;">{c['final_reasoning']}</p>
+        <p style="font-size:0.95rem;">{c.get('final_reasoning', '-')}</p>
+        <div class="plan-grid">
+            <div class="plan-cell entry">
+                <div class="plan-label">จุดเข้าซื้อ</div>
+                <div class="plan-value">{c.get('entry_price', '-')}</div>
+            </div>
+            <div class="plan-cell stop">
+                <div class="plan-label">Stop Loss</div>
+                <div class="plan-value">{c.get('stop_loss', '-')}</div>
+            </div>
+            <div class="plan-cell target">
+                <div class="plan-label">Take Profit</div>
+                <div class="plan-value">{c.get('take_profit', '-')}</div>
+            </div>
+        </div>
+        <div class="divider-thin"></div>
+        <p style="color:#7b8494; font-size:0.85rem; margin-bottom:6px;">💼 การบริหารความเสี่ยง</p>
+        <p style="font-size:0.9rem;">{c.get('position_sizing_note', '-')}</p>
     </div>
     """, unsafe_allow_html=True)
 else:
