@@ -72,6 +72,20 @@ class ClaudeVerdict(BaseModel):
 
 
 # ============================================================
+# 📋 รายชื่อหุ้นสำหรับ Scanner
+# ============================================================
+
+US_STOCKS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+             "AMD", "INTC", "NFLX", "AVGO", "ORCL", "CRM", "ADBE", "QCOM"]
+
+SET_STOCKS = ["PTT.BK", "KBANK.BK", "SCB.BK", "AOT.BK", "CPALL.BK",
+              "ADVANC.BK", "GULF.BK", "BBL.BK", "MINT.BK", "CPN.BK",
+              "DELTA.BK", "BDMS.BK", "TRUE.BK", "TOP.BK", "IVL.BK"]
+
+SCAN_VOL_MULTIPLIER = 2.0
+
+
+# ============================================================
 # 🔄 SESSION STATE
 # ============================================================
 
@@ -80,6 +94,8 @@ defaults = {
     "timeframe": "6M (รายวัน)",
     "debate_result": None,
     "debate_running": False,
+    "scan_results": [],
+    "scan_running": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -191,6 +207,22 @@ h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spa
 [data-testid="stSidebar"] { background: var(--panel); border-right: 1px solid var(--border); }
 .stTextInput input, .stSelectbox > div > div { background: var(--panel-2) !important; border-color: var(--border) !important; }
 [data-testid="stMetricValue"] { font-family: 'Space Grotesk', sans-serif; }
+
+/* Scanner */
+.scan-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+}
+.scan-badge {
+    display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: 0.68rem;
+    font-weight: 600; margin-right: 4px; margin-bottom: 4px;
+}
+.badge-buy { background: rgba(74,222,128,0.12); color: var(--green); border: 1px solid rgba(74,222,128,0.3); }
+.badge-sell { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+.badge-neutral { background: rgba(123,132,148,0.12); color: var(--text-dim); border: 1px solid var(--border); }
+.badge-vol { background: rgba(201,168,106,0.12); color: var(--verdict); border: 1px solid rgba(201,168,106,0.3); }
+
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -245,6 +277,95 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "macd_hist": round(macd_hist, 4),
         "vol_ratio": vol_ratio,
     }
+
+
+def scan_one_ticker(ticker: str) -> dict | None:
+    """สแกนหุ้น 1 ตัวด้วยทุกเงื่อนไข: RSI, MACD Cross, Bollinger Breakout, Volume Spike"""
+    try:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        if df.empty or len(df) < 35:
+            return None
+
+        close = df["Close"]
+        volume = df["Volume"]
+
+        # RSI
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/14).mean()
+        loss = -delta.where(delta < 0, 0).ewm(alpha=1/14).mean()
+        rsi = float((100 - (100 / (1 + (gain / loss)))).iloc[-1])
+
+        # MACD Cross
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9).mean()
+        macd_now = float((macd_line - signal_line).iloc[-1])
+        macd_prev = float((macd_line - signal_line).iloc[-2])
+        macd_bullish_cross = macd_prev < 0 and macd_now > 0
+        macd_bearish_cross = macd_prev > 0 and macd_now < 0
+
+        # Bollinger Band
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        bb_upper = float((ma20 + std20 * 2).iloc[-1])
+        bb_lower = float((ma20 - std20 * 2).iloc[-1])
+
+        # Volume spike
+        vol_avg = float(volume.rolling(20).mean().iloc[-1])
+        vol_now = float(volume.iloc[-1])
+        vol_ratio = round(vol_now / vol_avg, 2) if vol_avg > 0 else 1.0
+        vol_spike = vol_ratio >= SCAN_VOL_MULTIPLIER
+
+        price = float(close.iloc[-1])
+        prev_price = float(close.iloc[-2])
+        change_pct = round((price - prev_price) / prev_price * 100, 2)
+
+        # สร้างสัญญาณ
+        signals = []
+        if rsi < 30:
+            signals.append(("RSI Oversold", "buy"))
+        elif rsi > 70:
+            signals.append(("RSI Overbought", "sell"))
+        if macd_bullish_cross:
+            signals.append(("MACD Bullish Cross", "buy"))
+        elif macd_bearish_cross:
+            signals.append(("MACD Bearish Cross", "sell"))
+        if price > bb_upper:
+            signals.append(("BB Breakout บน", "buy" if vol_spike else "neutral"))
+        elif price < bb_lower:
+            signals.append(("BB Breakout ล่าง", "sell" if vol_spike else "neutral"))
+        if vol_spike:
+            signals.append((f"Volume x{vol_ratio}", "vol"))
+
+        if not signals:
+            return None  # ไม่มีสัญญาณน่าสนใจ ไม่ต้องแสดง
+
+        return {
+            "ticker": ticker,
+            "price": round(price, 2),
+            "change_pct": change_pct,
+            "rsi": round(rsi, 2),
+            "vol_ratio": vol_ratio,
+            "signals": signals,
+            "signal_count": len(signals),
+        }
+    except Exception:
+        return None
+
+
+def scan_market(tickers: list[str]) -> list[dict]:
+    """สแกนหุ้นทั้งลิสต์ คืนเฉพาะตัวที่มีสัญญาณ เรียงตามจำนวนสัญญาณมากไปน้อย"""
+    results = []
+    for t in tickers:
+        r = scan_one_ticker(t)
+        if r:
+            results.append(r)
+    results.sort(key=lambda x: x["signal_count"], reverse=True)
+    return results
 
 
 # ============================================================
@@ -365,6 +486,12 @@ with st.sidebar:
     run_clicked = st.button("▶ เริ่ม AI Debate", type="primary", use_container_width=True,
                              disabled=not (GEMINI_API_KEY and ANTHROPIC_API_KEY))
 
+    st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
+
+    st.markdown("**🔍 Scanner**")
+    scan_market_choice = st.selectbox("ตลาด", ["ทั้งสองตลาด", "หุ้นไทย (SET)", "หุ้นสหรัฐ (US)"])
+    scan_clicked = st.button("🔍 สแกนหุ้น", use_container_width=True)
+
 
 # ============================================================
 # 📌 HEADER
@@ -379,6 +506,58 @@ st.markdown(f"""
     <div class="tag">{datetime.now().strftime('%Y-%m-%d %H:%M')} · {st.session_state.active_ticker}</div>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ============================================================
+# 📌 SCANNER EXECUTION & RESULTS
+# ============================================================
+
+if scan_clicked:
+    if scan_market_choice == "หุ้นไทย (SET)":
+        tickers_to_scan = SET_STOCKS
+    elif scan_market_choice == "หุ้นสหรัฐ (US)":
+        tickers_to_scan = US_STOCKS
+    else:
+        tickers_to_scan = SET_STOCKS + US_STOCKS
+
+    with st.spinner(f"🔍 กำลังสแกน {len(tickers_to_scan)} หุ้น..."):
+        st.session_state.scan_results = scan_market(tickers_to_scan)
+
+if st.session_state.scan_results:
+    st.markdown(f"""
+    <div class="scan-header">
+        <div class="card-title" style="margin-bottom:0;">📋 ผลสแกน — พบ {len(st.session_state.scan_results)} หุ้นที่มีสัญญาณ</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    for r in st.session_state.scan_results:
+        badge_html = ""
+        for label, kind in r["signals"]:
+            cls = {"buy": "badge-buy", "sell": "badge-sell", "neutral": "badge-neutral", "vol": "badge-vol"}[kind]
+            badge_html += f'<span class="scan-badge {cls}">{label}</span>'
+
+        change_color = "var(--green)" if r["change_pct"] >= 0 else "var(--red)"
+
+        col_info, col_badges, col_btn = st.columns([2, 5, 1.3])
+        with col_info:
+            st.markdown(f"""
+            <div style="padding-top:6px;">
+                <span style="font-family:'Space Grotesk',sans-serif; font-weight:600; font-size:1rem;">{r['ticker']}</span>
+                <span style="color:{change_color}; font-size:0.85rem; margin-left:8px;">${r['price']} ({r['change_pct']:+.2f}%)</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_badges:
+            st.markdown(f"<div style='padding-top:6px;'>{badge_html}</div>", unsafe_allow_html=True)
+        with col_btn:
+            if st.button("วิเคราะห์ →", key=f"select_{r['ticker']}", use_container_width=True):
+                st.session_state.active_ticker = r["ticker"]
+                st.session_state.debate_result = None
+                st.rerun()
+
+    st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
+else:
+    st.caption("💡 กด **🔍 สแกนหุ้น** ที่แถบด้านซ้ายเพื่อค้นหาหุ้นที่มีสัญญาณ RSI / MACD / Bollinger / Volume น่าสนใจ")
+    st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
 
 # ============================================================
