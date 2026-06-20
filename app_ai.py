@@ -823,7 +823,19 @@ else:
 # 📌 CHART
 # ============================================================
 
+def to_tradingview_symbol(yf_ticker: str) -> str:
+    """
+    แปลง ticker จากฟอร์แมต yfinance เป็นฟอร์แมตที่ TradingView รู้จัก
+    yfinance หุ้นไทย: 'PTT.BK'  →  TradingView: 'SET:PTT'
+    yfinance หุ้น US: 'AAPL'    →  TradingView: 'AAPL' (ใช้ได้ตรงๆ ส่วนใหญ่)
+    """
+    if yf_ticker.upper().endswith(".BK"):
+        return "SET:" + yf_ticker[:-3].upper()
+    return yf_ticker.upper()
+
+
 ticker = st.session_state.active_ticker
+tv_symbol = to_tradingview_symbol(ticker)
 
 tradingview_html = f"""
 <div class="tradingview-widget-container" style="height:380px;width:100%">
@@ -831,7 +843,7 @@ tradingview_html = f"""
   <script src="https://s3.tradingview.com/tv.js"></script>
   <script>
   new TradingView.widget({{
-    "autosize": true, "symbol": "{ticker}", "interval": "{current_tf['tv']}",
+    "autosize": true, "symbol": "{tv_symbol}", "interval": "{current_tf['tv']}",
     "timezone": "Asia/Bangkok", "theme": "dark", "style": "1", "locale": "th",
     "enable_publishing": false, "hide_side_toolbar": false,
     "studies": ["RSI@tv-basicstudies", "MASimple@tv-basicstudies"],
