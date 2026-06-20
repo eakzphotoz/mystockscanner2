@@ -77,17 +77,60 @@ class ClaudeVerdict(BaseModel):
 
 
 # ============================================================
-# 📋 รายชื่อหุ้นสำหรับ Scanner
+# 📋 รายชื่อหุ้นสำหรับ Scanner — ดึงจริงจาก SET100, S&P500, Nasdaq100
 # ============================================================
 
-US_STOCKS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
-             "AMD", "INTC", "NFLX", "AVGO", "ORCL", "CRM", "ADBE", "QCOM"]
+# SET100 ไม่มีตาราง Wikipedia ที่ดึงง่าย ใช้ list คงที่ (อัปเดตตามรอบทบทวนของ SET ทุก 6 เดือน)
+SET100_TICKERS = [
+    "ADVANC", "AOT", "AWC", "BANPU", "BBL", "BCP", "BDMS", "BEM", "BGRIM", "BH",
+    "BTS", "CBG", "CENTEL", "CPALL", "CPF", "CPN", "CRC", "DELTA", "EA", "EGCO",
+    "GLOBAL", "GPSC", "GULF", "HMPRO", "INTUCH", "IRPC", "IVL", "KBANK", "KCE", "KTB",
+    "KTC", "LH", "MINT", "MTC", "OR", "OSP", "PTT", "PTTEP", "PTTGC", "RATCH",
+    "SAWAD", "SCB", "SCC", "SCGP", "TASCO", "TIDLOR", "TISCO", "TOP", "TRUE", "TTB",
+    "TU", "WHA", "AMATA", "AP", "BCH", "BJC", "BLA", "CHG", "CK", "CKP",
+    "COM7", "DOHOME", "ERW", "ESSO", "GFPT", "GUNKUL", "ICHI", "JMART", "JMT", "KKP",
+    "MAJOR", "MEGA", "MFC", "MOSHI", "ORI", "PLANB", "PR9", "PSL", "QH", "RS",
+    "SABUY", "SAPPE", "SIRI", "SJWD", "SPALI", "SPRC", "STA", "STGT", "STECON", "SUPER",
+    "TFG", "THANI", "THG", "TKN", "TOA", "TVO", "VGI", "WICE", "ITC", "SISB"
+]
+SET_STOCKS_FALLBACK = [t + ".BK" for t in SET100_TICKERS]
 
-SET_STOCKS = ["PTT.BK", "KBANK.BK", "SCB.BK", "AOT.BK", "CPALL.BK",
-              "ADVANC.BK", "GULF.BK", "BBL.BK", "MINT.BK", "CPN.BK",
-              "DELTA.BK", "BDMS.BK", "TRUE.BK", "TOP.BK", "IVL.BK"]
+
+@st.cache_data(ttl=86400)  # cache 1 วัน ไม่ต้องดึงใหม่ทุกครั้ง
+def get_set100_tickers() -> list[str]:
+    return [t + ".BK" for t in SET100_TICKERS]
+
+
+@st.cache_data(ttl=86400)
+def get_sp500_tickers() -> list[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        df = tables[0]
+        col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+        tickers = df[col].astype(str).str.replace(".", "-", regex=False).tolist()
+        return tickers
+    except Exception:
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "ORCL", "CRM"]
+
+
+@st.cache_data(ttl=86400)
+def get_nasdaq100_tickers() -> list[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        tables = pd.read_html(url)
+        for df in tables:
+            cols = [str(c) for c in df.columns]
+            if "Ticker" in cols or "Symbol" in cols:
+                col = "Ticker" if "Ticker" in cols else "Symbol"
+                return df[col].astype(str).tolist()
+        return []
+    except Exception:
+        return []
+
 
 SCAN_VOL_MULTIPLIER = 2.0
+SCAN_BATCH_SIZE = 50  # ดึงทีละ 50 ตัวต่อ batch กัน rate limit
 
 
 # ============================================================
@@ -308,12 +351,9 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     }
 
 
-def scan_one_ticker(ticker: str) -> dict | None:
-    """สแกนหุ้น 1 ตัวด้วยทุกเงื่อนไข: RSI, MACD Cross, Bollinger Breakout, Volume Spike"""
+def _compute_signals_from_df(ticker: str, df: pd.DataFrame) -> dict | None:
+    """คำนวณสัญญาณจาก DataFrame ราคาของหุ้น 1 ตัว (ใช้ร่วมกับ batch scan)"""
     try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
         df = df.dropna()
         if df.empty or len(df) < 35:
             return None
@@ -321,13 +361,11 @@ def scan_one_ticker(ticker: str) -> dict | None:
         close = df["Close"]
         volume = df["Volume"]
 
-        # RSI
         delta = close.diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14).mean()
         loss = -delta.where(delta < 0, 0).ewm(alpha=1/14).mean()
         rsi = float((100 - (100 / (1 + (gain / loss)))).iloc[-1])
 
-        # MACD Cross
         ema12 = close.ewm(span=12).mean()
         ema26 = close.ewm(span=26).mean()
         macd_line = ema12 - ema26
@@ -337,13 +375,11 @@ def scan_one_ticker(ticker: str) -> dict | None:
         macd_bullish_cross = macd_prev < 0 and macd_now > 0
         macd_bearish_cross = macd_prev > 0 and macd_now < 0
 
-        # Bollinger Band
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
         bb_upper = float((ma20 + std20 * 2).iloc[-1])
         bb_lower = float((ma20 - std20 * 2).iloc[-1])
 
-        # Volume spike
         vol_avg = float(volume.rolling(20).mean().iloc[-1])
         vol_now = float(volume.iloc[-1])
         vol_ratio = round(vol_now / vol_avg, 2) if vol_avg > 0 else 1.0
@@ -353,7 +389,6 @@ def scan_one_ticker(ticker: str) -> dict | None:
         prev_price = float(close.iloc[-2])
         change_pct = round((price - prev_price) / prev_price * 100, 2)
 
-        # สร้างสัญญาณ
         signals = []
         if rsi < 30:
             signals.append(("RSI Oversold", "buy"))
@@ -371,7 +406,7 @@ def scan_one_ticker(ticker: str) -> dict | None:
             signals.append((f"Volume x{vol_ratio}", "vol"))
 
         if not signals:
-            return None  # ไม่มีสัญญาณน่าสนใจ ไม่ต้องแสดง
+            return None
 
         return {
             "ticker": ticker,
@@ -386,13 +421,53 @@ def scan_one_ticker(ticker: str) -> dict | None:
         return None
 
 
-def scan_market(tickers: list[str]) -> list[dict]:
-    """สแกนหุ้นทั้งลิสต์ คืนเฉพาะตัวที่มีสัญญาณ เรียงตามจำนวนสัญญาณมากไปน้อย"""
+def scan_one_ticker(ticker: str) -> dict | None:
+    """สแกนหุ้น 1 ตัว (ใช้กรณี fallback หรือสแกนเดี่ยว)"""
+    try:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return _compute_signals_from_df(ticker, df)
+    except Exception:
+        return None
+
+
+def scan_market(tickers: list[str], progress_callback=None) -> list[dict]:
+    """
+    สแกนหุ้นทั้งลิสต์แบบ batch (เร็วกว่าทีละตัวมาก)
+    ดึงทีละ SCAN_BATCH_SIZE ตัว เพื่อกัน rate limit จาก yfinance
+    """
     results = []
-    for t in tickers:
-        r = scan_one_ticker(t)
-        if r:
-            results.append(r)
+    tickers = list(dict.fromkeys(tickers))  # ตัดตัวซ้ำ คงลำดับเดิม
+    total_batches = (len(tickers) + SCAN_BATCH_SIZE - 1) // SCAN_BATCH_SIZE
+
+    for batch_idx in range(total_batches):
+        batch = tickers[batch_idx * SCAN_BATCH_SIZE: (batch_idx + 1) * SCAN_BATCH_SIZE]
+        if progress_callback:
+            progress_callback(batch_idx, total_batches, batch)
+
+        try:
+            raw = yf.download(
+                " ".join(batch), period="3mo", interval="1d",
+                group_by="ticker", auto_adjust=False, progress=False, threads=True
+            )
+        except Exception:
+            continue
+
+        for t in batch:
+            try:
+                if len(batch) == 1:
+                    sub_df = raw
+                elif t in raw.columns.get_level_values(0):
+                    sub_df = raw[t]
+                else:
+                    continue
+                r = _compute_signals_from_df(t, sub_df)
+                if r:
+                    results.append(r)
+            except Exception:
+                continue
+
     results.sort(key=lambda x: x["signal_count"], reverse=True)
     return results
 
@@ -526,8 +601,12 @@ with st.sidebar:
     st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
     st.markdown("**🔍 Scanner**")
-    scan_market_choice = st.selectbox("ตลาด", ["ทั้งสองตลาด", "หุ้นไทย (SET)", "หุ้นสหรัฐ (US)"])
+    scan_market_choice = st.selectbox(
+        "ขอบเขตตลาด",
+        ["SET100 + S&P500 + Nasdaq100 (ทั้งหมด)", "SET100 (หุ้นไทย)", "S&P500 (US)", "Nasdaq100 (US)"]
+    )
     scan_clicked = st.button("🔍 สแกนหุ้น", use_container_width=True)
+    st.caption("⏱️ สแกนทั้งหมด (~700 ตัว) ใช้เวลาประมาณ 3-6 นาที")
 
 
 # ============================================================
@@ -550,15 +629,28 @@ st.markdown(f"""
 # ============================================================
 
 if scan_clicked:
-    if scan_market_choice == "หุ้นไทย (SET)":
-        tickers_to_scan = SET_STOCKS
-    elif scan_market_choice == "หุ้นสหรัฐ (US)":
-        tickers_to_scan = US_STOCKS
+    if scan_market_choice == "SET100 (หุ้นไทย)":
+        tickers_to_scan = get_set100_tickers()
+    elif scan_market_choice == "S&P500 (US)":
+        tickers_to_scan = get_sp500_tickers()
+    elif scan_market_choice == "Nasdaq100 (US)":
+        tickers_to_scan = get_nasdaq100_tickers()
     else:
-        tickers_to_scan = SET_STOCKS + US_STOCKS
+        tickers_to_scan = list(dict.fromkeys(
+            get_set100_tickers() + get_sp500_tickers() + get_nasdaq100_tickers()
+        ))
 
-    with st.spinner(f"🔍 กำลังสแกน {len(tickers_to_scan)} หุ้น..."):
-        st.session_state.scan_results = scan_market(tickers_to_scan)
+    progress_bar = st.progress(0, text=f"เตรียมสแกน {len(tickers_to_scan)} หุ้น...")
+
+    def _update_progress(batch_idx, total_batches, batch):
+        pct = int((batch_idx) / total_batches * 100)
+        progress_bar.progress(
+            min(pct, 99),
+            text=f"กำลังสแกนกลุ่มที่ {batch_idx + 1}/{total_batches} ({batch[0]} ...)"
+        )
+
+    st.session_state.scan_results = scan_market(tickers_to_scan, progress_callback=_update_progress)
+    progress_bar.progress(100, text=f"✅ สแกนครบ {len(tickers_to_scan)} หุ้นแล้ว")
 
 if st.session_state.scan_results:
     st.markdown(f"""
