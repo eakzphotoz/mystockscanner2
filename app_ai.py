@@ -270,6 +270,16 @@ h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif !important; letter-spa
 .badge-neutral { background: rgba(123,132,148,0.12); color: var(--text-dim); border: 1px solid var(--border); }
 .badge-vol { background: rgba(201,168,106,0.12); color: var(--verdict); border: 1px solid rgba(201,168,106,0.3); }
 
+/* Strategy tags — กลับตัวขึ้น / Take Profit (เด่นกว่า badge สัญญาณย่อย) */
+.strategy-tag {
+    display: inline-block; padding: 3px 11px; border-radius: 6px; font-size: 0.72rem;
+    font-weight: 700; margin-right: 5px; margin-bottom: 4px;
+}
+.tag-reversal-short { background: rgba(74,222,128,0.22); color: #6ee7a0; border: 1px solid rgba(74,222,128,0.55); }
+.tag-reversal-medium { background: rgba(74,222,128,0.14); color: #4ade80; border: 1.5px solid rgba(74,222,128,0.45); }
+.tag-takeprofit-short { background: rgba(217,119,87,0.22); color: #f0a085; border: 1px solid rgba(217,119,87,0.55); }
+.tag-takeprofit-medium { background: rgba(217,119,87,0.14); color: #d97757; border: 1.5px solid rgba(217,119,87,0.45); }
+
 [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; }
 
 /* Quick action banner */
@@ -352,47 +362,118 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 
 def _compute_signals_from_df(ticker: str, df: pd.DataFrame) -> dict | None:
-    """คำนวณสัญญาณจาก DataFrame ราคาของหุ้น 1 ตัว (ใช้ร่วมกับ batch scan)"""
+    """
+    คำนวณสัญญาณจาก DataFrame ราคาของหุ้น 1 ตัว
+    ครอบคลุม: เงื่อนไขเดิม (RSI/MACD/BB/Volume) + Reversal Buy และ Take Profit
+    ทั้งระยะสั้น (1-5 วัน) และระยะกลาง (1-4 สัปดาห์)
+    """
     try:
         df = df.dropna()
-        if df.empty or len(df) < 35:
+        if df.empty or len(df) < 60:   # ต้องมีข้อมูลพอสำหรับ EMA50
             return None
 
         close = df["Close"]
         volume = df["Volume"]
 
+        # ---------- RSI (14) สำหรับเงื่อนไขเดิม + ระยะกลาง ----------
         delta = close.diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14).mean()
         loss = -delta.where(delta < 0, 0).ewm(alpha=1/14).mean()
-        rsi = float((100 - (100 / (1 + (gain / loss)))).iloc[-1])
+        rsi14_series = 100 - (100 / (1 + (gain / loss)))
+        rsi14 = float(rsi14_series.iloc[-1])
+        rsi14_prev = float(rsi14_series.iloc[-2])
 
+        # ---------- RSI (7) สำหรับระยะสั้น (ไวกว่า) ----------
+        gain7 = delta.where(delta > 0, 0).ewm(alpha=1/7).mean()
+        loss7 = -delta.where(delta < 0, 0).ewm(alpha=1/7).mean()
+        rsi7_series = 100 - (100 / (1 + (gain7 / loss7)))
+        rsi7 = float(rsi7_series.iloc[-1])
+        rsi7_prev3 = float(rsi7_series.iloc[-4]) if len(rsi7_series) > 4 else rsi7
+
+        # ---------- MACD (12,26,9) — ใช้ทั้งระยะสั้น/กลาง ----------
         ema12 = close.ewm(span=12).mean()
         ema26 = close.ewm(span=26).mean()
         macd_line = ema12 - ema26
         signal_line = macd_line.ewm(span=9).mean()
-        macd_now = float((macd_line - signal_line).iloc[-1])
-        macd_prev = float((macd_line - signal_line).iloc[-2])
+        macd_hist_series = macd_line - signal_line
+        macd_now = float(macd_hist_series.iloc[-1])
+        macd_prev = float(macd_hist_series.iloc[-2])
         macd_bullish_cross = macd_prev < 0 and macd_now > 0
         macd_bearish_cross = macd_prev > 0 and macd_now < 0
+        macd_rising = macd_now > macd_prev
 
+        # ---------- EMA 20 / 50 สำหรับระยะกลาง ----------
+        ema20 = close.ewm(span=20).mean()
+        ema50 = close.ewm(span=50).mean()
+        ema20_now, ema50_now = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+        ema20_prev, ema50_prev = float(ema20.iloc[-2]), float(ema50.iloc[-2])
+        ema_bullish_cross = ema20_prev < ema50_prev and ema20_now > ema50_now
+        ema_bearish_cross = ema20_prev > ema50_prev and ema20_now < ema50_now
+        above_ema_trend = ema20_now > ema50_now
+
+        # ---------- Bollinger Band (เงื่อนไขเดิม) ----------
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
         bb_upper = float((ma20 + std20 * 2).iloc[-1])
         bb_lower = float((ma20 - std20 * 2).iloc[-1])
 
+        # ---------- Volume ----------
         vol_avg = float(volume.rolling(20).mean().iloc[-1])
         vol_now = float(volume.iloc[-1])
         vol_ratio = round(vol_now / vol_avg, 2) if vol_avg > 0 else 1.0
         vol_spike = vol_ratio >= SCAN_VOL_MULTIPLIER
 
+        # ---------- ราคา & แท่งเทียนล่าสุด ----------
         price = float(close.iloc[-1])
         prev_price = float(close.iloc[-2])
         change_pct = round((price - prev_price) / prev_price * 100, 2)
 
+        open_now = float(df["Open"].iloc[-1])
+        candle_is_red = price < open_now          # แท่งวันนี้ปิดต่ำกว่าเปิด (แรงขาย)
+        candle_is_green = price > open_now         # แท่งวันนี้ปิดสูงกว่าเปิด (แรงซื้อ)
+
+        # ระยะห่างจากจุดสูงสุด/ต่ำสุดในช่วงที่ผ่านมา (ใช้ดูว่าวิ่งมาไกลแค่ไหนแล้ว)
+        high_20 = float(close.rolling(20).max().iloc[-1])
+        low_20 = float(close.rolling(20).min().iloc[-1])
+        pct_from_high20 = round((price - high_20) / high_20 * 100, 2)  # ลบ = ต่ำกว่าจุดสูงสุด
+        pct_from_low20 = round((price - low_20) / low_20 * 100, 2)     # บวก = สูงกว่าจุดต่ำสุด
+
+        # ============================================================
+        # 🏷️ แท็กกลยุทธ์ — Reversal Buy / Take Profit (สั้น + กลาง)
+        # ============================================================
+        strategy_tags = []  # [(label, kind), ...] kind: "reversal" หรือ "takeprofit"
+
+        # --- กลับตัวขึ้น ระยะสั้น (1-5 วัน) ---
+        # RSI(7) เคยอยู่ใน oversold เมื่อ 1-3 วันก่อน แล้วตอนนี้ดีดขึ้นมา + แท่งเขียว
+        short_reversal_buy = (rsi7_prev3 < 30) and (rsi7 > rsi7_prev3) and (rsi7 < 50) and candle_is_green
+        if short_reversal_buy:
+            strategy_tags.append(("กลับตัวขึ้น (สั้น)", "reversal-short"))
+
+        # --- กลับตัวขึ้น ระยะกลาง (1-4 สัปดาห์) ---
+        # EMA20 ตัดขึ้น EMA50 (โมเมนตัมเปลี่ยนเทรนด์) + RSI14 ฟื้นจากโซนอ่อนแอ (<55) แต่ยังไม่ overbought
+        medium_reversal_buy = ema_bullish_cross and (35 < rsi14 < 60) and macd_rising
+        if medium_reversal_buy:
+            strategy_tags.append(("กลับตัวขึ้น (กลาง)", "reversal-medium"))
+
+        # --- Take Profit ระยะสั้น (1-5 วัน) ---
+        # RSI(7) เคย overbought แล้วร่วงลงมา + แท่งแดง + ใกล้จุดสูงสุด 20 วัน
+        short_take_profit = (rsi7_prev3 > 70) and (rsi7 < rsi7_prev3) and candle_is_red and (pct_from_high20 > -5)
+        if short_take_profit:
+            strategy_tags.append(("Take Profit (สั้น)", "takeprofit-short"))
+
+        # --- Take Profit ระยะกลาง (1-4 สัปดาห์) ---
+        # เทรนด์เป็นขาขึ้นมานาน (ราคาอยู่เหนือ EMA50 และ EMA20>EMA50) แต่ MACD เพิ่งตัดลง (โมเมนตัมเริ่มอ่อน)
+        medium_take_profit = above_ema_trend and macd_bearish_cross and (price > ema50_now)
+        if medium_take_profit:
+            strategy_tags.append(("Take Profit (กลาง)", "takeprofit-medium"))
+
+        # ============================================================
+        # 🔧 สัญญาณเดิม (RSI/MACD/BB/Volume แยกเดี่ยว) — ยังคงไว้
+        # ============================================================
         signals = []
-        if rsi < 30:
+        if rsi14 < 30:
             signals.append(("RSI Oversold", "buy"))
-        elif rsi > 70:
+        elif rsi14 > 70:
             signals.append(("RSI Overbought", "sell"))
         if macd_bullish_cross:
             signals.append(("MACD Bullish Cross", "buy"))
@@ -405,17 +486,19 @@ def _compute_signals_from_df(ticker: str, df: pd.DataFrame) -> dict | None:
         if vol_spike:
             signals.append((f"Volume x{vol_ratio}", "vol"))
 
-        if not signals:
+        # ต้องมีอย่างน้อย 1 สัญญาณเดิม หรือ 1 แท็กกลยุทธ์ใหม่ ถึงจะแสดงผล
+        if not signals and not strategy_tags:
             return None
 
         return {
             "ticker": ticker,
             "price": round(price, 2),
             "change_pct": change_pct,
-            "rsi": round(rsi, 2),
+            "rsi": round(rsi14, 2),
             "vol_ratio": vol_ratio,
             "signals": signals,
-            "signal_count": len(signals),
+            "strategy_tags": strategy_tags,
+            "signal_count": len(signals) + len(strategy_tags),
         }
     except Exception:
         return None
@@ -424,7 +507,7 @@ def _compute_signals_from_df(ticker: str, df: pd.DataFrame) -> dict | None:
 def scan_one_ticker(ticker: str) -> dict | None:
     """สแกนหุ้น 1 ตัว (ใช้กรณี fallback หรือสแกนเดี่ยว)"""
     try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        df = yf.download(ticker, period="6mo", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return _compute_signals_from_df(ticker, df)
@@ -448,7 +531,7 @@ def scan_market(tickers: list[str], progress_callback=None) -> list[dict]:
 
         try:
             raw = yf.download(
-                " ".join(batch), period="3mo", interval="1d",
+                " ".join(batch), period="6mo", interval="1d",
                 group_by="ticker", auto_adjust=False, progress=False, threads=True
             )
         except Exception:
@@ -653,13 +736,52 @@ if scan_clicked:
     progress_bar.progress(100, text=f"✅ สแกนครบ {len(tickers_to_scan)} หุ้นแล้ว")
 
 if st.session_state.scan_results:
+    total_found = len(st.session_state.scan_results)
+    n_reversal = sum(1 for r in st.session_state.scan_results if any(k.startswith("reversal") for _, k in r.get("strategy_tags", [])))
+    n_takeprofit = sum(1 for r in st.session_state.scan_results if any(k.startswith("takeprofit") for _, k in r.get("strategy_tags", [])))
+
     st.markdown(f"""
     <div class="scan-header">
-        <div class="card-title" style="margin-bottom:0;">📋 ผลสแกน — พบ {len(st.session_state.scan_results)} หุ้นที่มีสัญญาณ</div>
+        <div class="card-title" style="margin-bottom:0;">📋 ผลสแกน — พบ {total_found} หุ้น
+            <span style="font-size:0.78rem; color:#4ade80; font-weight:500;"> · {n_reversal} กลับตัวขึ้น</span>
+            <span style="font-size:0.78rem; color:#d97757; font-weight:500;"> · {n_takeprofit} Take Profit</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
-    for r in st.session_state.scan_results:
+    filter_choice = st.selectbox(
+        "กรองตามแท็กกลยุทธ์",
+        ["ทั้งหมด", "🟢 กลับตัวขึ้นเท่านั้น", "🟠 Take Profit เท่านั้น"],
+        label_visibility="collapsed"
+    )
+
+    if filter_choice == "🟢 กลับตัวขึ้นเท่านั้น":
+        display_results = [r for r in st.session_state.scan_results
+                            if any(k.startswith("reversal") for _, k in r.get("strategy_tags", []))]
+    elif filter_choice == "🟠 Take Profit เท่านั้น":
+        display_results = [r for r in st.session_state.scan_results
+                            if any(k.startswith("takeprofit") for _, k in r.get("strategy_tags", []))]
+    else:
+        display_results = st.session_state.scan_results
+
+    tag_class_map = {
+        "reversal-short": "tag-reversal-short",
+        "reversal-medium": "tag-reversal-medium",
+        "takeprofit-short": "tag-takeprofit-short",
+        "takeprofit-medium": "tag-takeprofit-medium",
+    }
+    tag_icon_map = {
+        "reversal-short": "🟢", "reversal-medium": "🟢",
+        "takeprofit-short": "🟠", "takeprofit-medium": "🟠",
+    }
+
+    for r in display_results:
+        strategy_html = ""
+        for label, kind in r.get("strategy_tags", []):
+            cls = tag_class_map.get(kind, "tag-reversal-short")
+            icon = tag_icon_map.get(kind, "")
+            strategy_html += f'<span class="strategy-tag {cls}">{icon} {label}</span>'
+
         badge_html = ""
         for label, kind in r["signals"]:
             cls = {"buy": "badge-buy", "sell": "badge-sell", "neutral": "badge-neutral", "vol": "badge-vol"}[kind]
@@ -676,16 +798,24 @@ if st.session_state.scan_results:
             </div>
             """, unsafe_allow_html=True)
         with col_badges:
-            st.markdown(f"<div style='padding-top:6px;'>{badge_html}</div>", unsafe_allow_html=True)
+            combined_html = ""
+            if strategy_html:
+                combined_html += f"<div style='margin-bottom:4px;'>{strategy_html}</div>"
+            if badge_html:
+                combined_html += f"<div>{badge_html}</div>"
+            st.markdown(f"<div style='padding-top:4px;'>{combined_html}</div>", unsafe_allow_html=True)
         with col_btn:
             if st.button("วิเคราะห์ →", key=f"select_{r['ticker']}", use_container_width=True):
                 st.session_state.active_ticker = r["ticker"]
                 st.session_state.debate_result = None
                 st.rerun()
 
+    if not display_results:
+        st.caption("ไม่พบหุ้นที่ตรงกับตัวกรองนี้")
+
     st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 else:
-    st.caption("💡 กด **🔍 สแกนหุ้น** ที่แถบด้านซ้ายเพื่อค้นหาหุ้นที่มีสัญญาณ RSI / MACD / Bollinger / Volume น่าสนใจ")
+    st.caption("💡 กด **🔍 สแกนหุ้น** ที่แถบด้านซ้ายเพื่อค้นหาหุ้นที่มีสัญญาณกลับตัวขึ้น, Take Profit, RSI, MACD, Bollinger หรือ Volume น่าสนใจ")
     st.markdown("<div class='divider-thin'></div>", unsafe_allow_html=True)
 
 
