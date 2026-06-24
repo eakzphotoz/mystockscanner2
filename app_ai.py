@@ -811,6 +811,33 @@ with col_right_panel:
 
 st.divider()
 
+def render_portfolio_and_scanner_area(port_id, categories, df, postfix):
+    st.subheader(f"📊 พอร์ตโฟลิโอ & สแกนเนอร์: {postfix}")
+    
+    selected_category = st.selectbox(
+        f"เลือกหมวดหมู่ ({postfix})", 
+        categories, 
+        key=f"category_{port_id}"
+    )
+    
+    display_df = df.copy()
+    if 'strategy_tags' in display_df.columns:
+        display_df['strategy_tags'] = display_df['strategy_tags'].apply(lambda x: ", ".join([tag[0] for tag in x]) if isinstance(x, list) else x)
+    if 'signals' in display_df.columns:
+        display_df['signals'] = display_df['signals'].apply(lambda x: ", ".join([sig[0] for sig in x]) if isinstance(x, list) else x)
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(f"🔍 สแกนตลาด {postfix}", key=f"scan_btn_{port_id}", use_container_width=True):
+            st.success(f"สแกนข้อมูลหมวด {selected_category} เรียบร้อยแล้ว!")
+    with col2:
+        if st.button(f"🤖 วิเคราะห์ด้วย AI", key=f"ai_btn_{port_id}", type="primary", use_container_width=True):
+            st.info(f"AI กำลังวิเคราะห์แนวโน้มของ {postfix}...")
+            
+    st.divider()
+
 # 2️⃣ BOTTOM SECTION: แท็บหน้าต่างแยกจัดการพอร์ต / สแกนเนอร์ และระบบ AI DEBATE
 st.markdown("### 💼 ระบบจัดการพอร์ต (แชร์ร่วมกัน) และสแกนเนอร์สมองกล")
 
@@ -1119,5 +1146,5 @@ with tab_crypto_class:
     )
 
 st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>"
-            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 2.5 และ Claude 3.5 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
+            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ Claude 3.5 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
             "</div>", unsafe_allow_html=True)
