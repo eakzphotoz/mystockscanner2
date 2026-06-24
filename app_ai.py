@@ -811,32 +811,6 @@ with col_right_panel:
 
 st.divider()
 
-def render_portfolio_and_scanner_area(port_id, categories, df, postfix):
-    st.subheader(f"📊 พอร์ตโฟลิโอ & สแกนเนอร์: {postfix}")
-    
-    selected_category = st.selectbox(
-        f"เลือกหมวดหมู่ ({postfix})", 
-        categories, 
-        key=f"category_{port_id}"
-    )
-    
-    display_df = df.copy()
-    if 'strategy_tags' in display_df.columns:
-        display_df['strategy_tags'] = display_df['strategy_tags'].apply(lambda x: ", ".join([tag[0] for tag in x]) if isinstance(x, list) else x)
-    if 'signals' in display_df.columns:
-        display_df['signals'] = display_df['signals'].apply(lambda x: ", ".join([sig[0] for sig in x]) if isinstance(x, list) else x)
-
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button(f"🔍 สแกนตลาด {postfix}", key=f"scan_btn_{port_id}", use_container_width=True):
-            st.success(f"สแกนข้อมูลหมวด {selected_category} เรียบร้อยแล้ว!")
-    with col2:
-        if st.button(f"🤖 วิเคราะห์ด้วย AI", key=f"ai_btn_{port_id}", type="primary", use_container_width=True):
-            st.info(f"AI กำลังวิเคราะห์แนวโน้มของ {postfix}...")
-            
-    st.divider()
 
 # 2️⃣ BOTTOM SECTION: แท็บหน้าต่างแยกจัดการพอร์ต / สแกนเนอร์ และระบบ AI DEBATE
 st.markdown("### 💼 ระบบจัดการพอร์ต (แชร์ร่วมกัน) และสแกนเนอร์สมองกล")
@@ -1119,7 +1093,33 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                 st.markdown(f"""<div style="background-color: #1e1b29; border-left: 4px solid #a855f7; padding: 10px; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1;"><strong>💡 แนะนำอนาคตพอร์ตครอบครัว:</strong><br>{p_res.get('strategic_advice', '-')}</div>""", unsafe_allow_html=True)
             else:
                 st.info("💡 คลิกเพื่อประเมินความเสี่ยงพอร์ตร่วมกันของแฟน")
+def render_portfolio_and_scanner_area(port_id, categories, df, postfix):
+    st.subheader(f"📊 พอร์ตโฟลิโอ & สแกนเนอร์: {postfix}")
+    
+    selected_category = st.selectbox(
+        f"เลือกหมวดหมู่ ({postfix})", 
+        categories, 
+        key=f"category_{port_id}"
+    )
+    
+    display_df = df.copy()
+    if 'strategy_tags' in display_df.columns:
+        display_df['strategy_tags'] = display_df['strategy_tags'].apply(lambda x: ", ".join([tag[0] for tag in x]) if isinstance(x, list) else x)
+    if 'signals' in display_df.columns:
+        display_df['signals'] = display_df['signals'].apply(lambda x: ", ".join([sig[0] for sig in x]) if isinstance(x, list) else x)
 
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(f"🔍 สแกนตลาด {postfix}", key=f"scan_btn_{port_id}", use_container_width=True):
+            st.success(f"สแกนข้อมูลหมวด {selected_category} เรียบร้อยแล้ว!")
+    with col2:
+        if st.button(f"🤖 วิเคราะห์ด้วย AI", key=f"ai_btn_{port_id}", type="primary", use_container_width=True):
+            st.info(f"AI กำลังวิเคราะห์แนวโน้มของ {postfix}...")
+            
+    st.divider()
+# ==========================================    
 # ดำเนินการกระจายหน้าตามแท็บคลาสต่างๆ
 with tab_us_class:
     render_portfolio_and_scanner_area(
