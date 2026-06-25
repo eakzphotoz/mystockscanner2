@@ -266,7 +266,11 @@ components.html(ticker_tape_html, height=50)
 
 # --- 🛠️ Helper Functions ---
 def fetch_data_with_header(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    # แก้ไข: เพิ่ม User-Agent แบบเต็มเพื่อหลีกเลี่ยงการถูก Wikipedia บล็อก (Error 403)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req) as response: 
         return response.read()
 
@@ -275,15 +279,22 @@ def load_market_tickers(market):
     try:
         if market == "S&P 500":
             csv_bytes = fetch_data_with_header('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv')
-            return pd.read_csv(io.BytesIO(csv_bytes))['Symbol'].tolist()
+            df = pd.read_csv(io.BytesIO(csv_bytes))
+            # แปลงจุดให้เป็นขีดเผื่อมีหุ้นคลาส (เช่น BRK.B -> BRK-B)
+            return df['Symbol'].astype(str).str.replace('.', '-').tolist()
+            
         elif "NASDAQ" in market:
             html_bytes = fetch_data_with_header('https://en.wikipedia.org/wiki/Nasdaq-100')
             tables = pd.read_html(io.StringIO(html_bytes.decode('utf-8')))
             for df in tables:
-                if 'Ticker' in df.columns or 'Symbol' in df.columns:
-                    return df['Ticker' if 'Ticker' in df.columns else 'Symbol'].tolist()
+                # แก้ไข: เช็คความยาวตารางป้องกันตารางสรุปสั้นๆ และรองรับทั้ง 'Ticker' และ 'Symbol'
+                if ('Ticker' in df.columns or 'Symbol' in df.columns) and len(df) > 50:
+                    col_name = 'Ticker' if 'Ticker' in df.columns else 'Symbol'
+                    return df[col_name].astype(str).str.replace('.', '-').tolist()
+                    
         elif market == "Penny Stocks (ต่ำกว่า $5)":
             return ["SNDL", "RIOT", "GRWG", "PLTR", "LCID", "SOFI", "NKLA", "DNA", "RIG", "MULN", "BBIG", "XELA"]
+            
         elif market == "SET100 (หุ้นไทย)":
             tickers = [
                 "ADVANC", "AOT", "AWC", "BANPU", "BBL", "BCP", "BDMS", "BEM", "BGRIM", "BH",
@@ -298,13 +309,17 @@ def load_market_tickers(market):
                 "TFG", "THANI", "THG", "TKN", "TOA", "TVO", "VGI", "WICE", "ITC", "SISB"
             ]
             return [t + ".BK" for t in tickers]
+            
         elif market == "SET50 (หุ้นไทย)":
             tickers = ["ADVANC", "AOT", "AWC", "BANPU", "BBL", "BDMS", "BEM", "BGRIM", "BH", "BTS", "CBG", "CENTEL", "COM7", "CPALL", "CPF", "CPN", "CRC", "DELTA", "EA", "EGCO", "GLOBAL", "GPSC", "GULF", "HMPRO", "INTUCH", "IRPC", "IVL", "JMART", "JMT", "KBANK", "KCE", "KTB", "KTC", "LH", "MINT", "MTC", "OR", "OSP", "PTT", "PTTEP", "PTTGC", "RATCH", "SAWAD", "SCB", "SCC", "SCGP", "TIDLOR", "TISCO", "TOP", "TRUE", "TTB", "TU", "WHA"]
             return [t + ".BK" for t in tickers]
+            
         elif market == "Crypto (Top Coins)":
             return ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOGE-USD", "TRX-USD", "DOT-USD"]
+            
         elif market == "Crypto (Alt/Meme Coins)":
             return ["SHIB-USD", "PEPE-USD", "WIF-USD", "FLOKI-USD", "BONK-USD", "MATIC-USD", "LINK-USD", "UNI-USD", "LTC-USD", "BCH-USD"]
+            
     except Exception as e: 
         st.sidebar.warning(f"Failed to fetch market data: {e}")
     return ['AAPL', 'MSFT', 'NVDA', 'AMZN'] # Fallback list
