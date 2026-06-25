@@ -604,7 +604,7 @@ def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
                 return block.input
         raise ValueError("Claude didn't yield tool block.")
         
-    return call_api_with_backoff(run_api_fn=run_claude)
+    return call_api_with_backoff(run_claude)
 
 def run_ai_debate(ticker, ind):
     gemini_op = gemini_first_opinion(
