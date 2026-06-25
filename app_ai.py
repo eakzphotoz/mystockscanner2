@@ -603,7 +603,7 @@ def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
     
     def run_claude():
         response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             system="คุณเป็นบอร์ดตัดสินใจเทรด ให้ตอบกลับเป็นรูปแบบ JSON เสมอเพื่อส่งคำตอบเข้าโครงสร้างระบบ",
             messages=[{"role": "user", "content": prompt}],
@@ -1135,5 +1135,5 @@ with tab_crypto_class:
     )
 
 st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>"
-            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ Claude 3.5 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
+            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ claude sonnet 4.6 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
             "</div>", unsafe_allow_html=True)
