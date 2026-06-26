@@ -21,6 +21,8 @@ try:
 except ImportError:
     pass  # รองรับเผื่อบางสภาพแวดล้อมไม่มีไลบรารี anthropic
 
+import journal  # 📓 โมดูลใหม่: Trade Journal + Win-Rate (แยกไฟล์ ไม่กระทบโค้ดเดิม)
+
 # --- ⚙️ การตั้งค่าหน้าเว็บ (Premium Dark Theme) ---
 st.set_page_config(
     page_title="PropFirmX - AI Debate & Shared Portfolio Terminal", 
@@ -45,6 +47,14 @@ ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 # 🗄️ DATABASE SETUP (Persistent Storage)
 # ==========================================
 DB_FILE = 'family_portfolio.db'
+
+# รายชื่อตารางที่อนุญาตให้ใช้งานเท่านั้น (ป้องกัน SQL Injection ผ่านชื่อตาราง
+# แม้ปัจจุบัน table_name จะมาจากค่าคงที่ในโค้ดเท่านั้น แต่กันไว้เผื่ออนาคตมีการรับชื่อตารางจาก UI/input)
+ALLOWED_PORTFOLIO_TABLES = {'port_us', 'port_th', 'port_crypto'}
+
+def _validate_table_name(table_name):
+    if table_name not in ALLOWED_PORTFOLIO_TABLES:
+        raise ValueError(f"ชื่อตารางไม่ได้รับอนุญาต: {table_name}")
 
 def init_db():
     """สร้างตารางฐานข้อมูล SQLite สำหรับเก็บพอร์ตร่วมกัน หากยังไม่มี"""
@@ -74,6 +84,7 @@ def init_db():
 def load_portfolio(table_name):
     """อ่านข้อมูลพอร์ตจาก SQLite เป็น DataFrame"""
     try:
+        _validate_table_name(table_name)
         conn = sqlite3.connect(DB_FILE)
         df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
         conn.close()
@@ -83,10 +94,46 @@ def load_portfolio(table_name):
         return pd.DataFrame(columns=["Ticker", "Shares", "AvgCost"])
 
 def save_portfolio(table_name, df):
-    """บันทึก DataFrame ทับลงในตาราง SQLite"""
+    """
+    บันทึก DataFrame ลงตาราง SQLite ด้วยวิธี Upsert (อัปเดต/เพิ่ม/ลบเฉพาะแถวที่เปลี่ยนแปลงจริง)
+    แทนการ DROP/REPLACE ตารางทั้งก้อนแบบเดิม เพื่อลดความเสี่ยงข้อมูลหายเวลามีคนแก้พอร์ต
+    พร้อมกันจากหลายอุปกรณ์ (เช่น คู่รักเปิดพร้อมกันคนละมือถือ)
+
+    หมายเหตุข้อจำกัด: วิธีนี้ลดความเสี่ยงจากการล้างตารางทั้งก้อน แต่ถ้าสองคนแก้ "แถวเดียวกัน"
+    พร้อมกันเป๊ะๆ ระบบยังเป็นแบบ Last-Write-Wins อยู่ดี — ถ้าต้องการแก้ปัญหานี้ทั้งหมดต้องเพิ่มระบบ
+    version/timestamp column + optimistic locking ซึ่งซับซ้อนกว่านี้
+    """
     try:
+        _validate_table_name(table_name)
         conn = sqlite3.connect(DB_FILE)
-        df.to_sql(table_name, conn, if_exists='replace', index=False)
+        cursor = conn.cursor()
+
+        clean_df = df.dropna(subset=["Ticker"]).copy()
+        clean_df["Ticker"] = clean_df["Ticker"].astype(str).str.strip()
+        clean_df = clean_df[clean_df["Ticker"] != ""]
+
+        current_tickers = set(clean_df["Ticker"].tolist())
+
+        cursor.execute(f'SELECT Ticker FROM {table_name}')
+        existing_tickers = {row[0] for row in cursor.fetchall()}
+
+        tickers_to_delete = existing_tickers - current_tickers
+        if tickers_to_delete:
+            cursor.executemany(
+                f'DELETE FROM {table_name} WHERE Ticker = ?',
+                [(t,) for t in tickers_to_delete]
+            )
+
+        upsert_rows = list(
+            clean_df[["Ticker", "Shares", "AvgCost"]].itertuples(index=False, name=None)
+        )
+        if upsert_rows:
+            cursor.executemany(
+                f'INSERT OR REPLACE INTO {table_name} (Ticker, Shares, AvgCost) VALUES (?, ?, ?)',
+                upsert_rows
+            )
+
+        conn.commit()
         conn.close()
     except Exception as e:
         st.error(f"Database Save Error ({table_name}): {e}")
@@ -98,8 +145,11 @@ else:
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.close()
-    except:
+    except sqlite3.Error as e:
+        print(f"DB file corrupted or unreadable, recreating: {e}")
         init_db()
+
+journal.init_journal_db()  # 📓 สร้างตาราง trade_journal ถ้ายังไม่มี (ปลอดภัย ใช้ IF NOT EXISTS)
 
 # ==========================================
 # 📊 SCHEMAS & MODELS FOR DEBATE
@@ -240,18 +290,6 @@ st.markdown("""
     .tag-reversal-medium { background: rgba(16,185,129,0.14); color: var(--green); border: 1.5px solid rgba(16,185,129,0.45); }
     .tag-takeprofit-short { background: rgba(217,119,87,0.22); color: #f0a085; border: 1px solid rgba(217,119,87,0.55); }
     .tag-takeprofit-medium { background: rgba(217,119,87,0.14); color: var(--claude); border: 1.5px solid rgba(217,119,87,0.45); }
-
-    /* Pulsing Status Dot */
-    .pulse-dot {
-        display: inline-block; width: 8px; height: 8px; background-color: var(--green);
-        border-radius: 50%; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
-        animation: pulsing 1.5s infinite; vertical-align: middle; margin-right: 6px;
-    }
-    @keyframes pulsing {
-        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-        70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
-        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -278,11 +316,7 @@ components.html(ticker_tape_html, height=50)
 
 # --- 🛠️ Helper Functions ---
 def fetch_data_with_header(url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req) as response: 
         return response.read()
 
@@ -290,53 +324,16 @@ def fetch_data_with_header(url):
 def load_market_tickers(market):
     try:
         if market == "S&P 500":
-            try:
-                csv_bytes = fetch_data_with_header('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv')
-                df = pd.read_csv(io.BytesIO(csv_bytes))
-                return df['Symbol'].astype(str).str.replace('.', '-').tolist()
-            except Exception as e:
-                st.sidebar.warning(f"S&P 500 GitHub load failed, using top stocks fallback. ({e})")
-                return ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "BRK-B", "TSLA", "UNH", "JNJ", "XOM", "JPM", "LLY", "AVGO", "PG"]
-            
+            csv_bytes = fetch_data_with_header('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv')
+            return pd.read_csv(io.BytesIO(csv_bytes))['Symbol'].tolist()
         elif "NASDAQ" in market:
-            try:
-                csv_bytes = fetch_data_with_header('https://yfiua.github.io/index-constituents/constituents-nasdaq100.csv')
-                df = pd.read_csv(io.BytesIO(csv_bytes))
-                if 'Symbol' in df.columns:
-                    return df['Symbol'].astype(str).str.replace('.', '-').tolist()
-                elif 'Ticker' in df.columns:
-                    return df['Ticker'].astype(str).str.replace('.', '-').tolist()
-            except Exception as e_git:
-                st.sidebar.warning(f"NASDAQ GitHub API Fetch failed. Trying Wikipedia... ({e_git})")
-            
-            try:
-                html_bytes = fetch_data_with_header('https://en.wikipedia.org/wiki/Nasdaq-100')
-                tables = pd.read_html(io.StringIO(html_bytes.decode('utf-8')))
-                for df in tables:
-                    cols_lower = [str(c).lower().strip() for c in df.columns]
-                    col_index = None
-                    for target in ['ticker', 'symbol', 'ticker symbol']:
-                        if target in cols_lower:
-                            col_index = cols_lower.index(target)
-                            break
-                    
-                    if col_index is not None and len(df) > 50:
-                        col_name = df.columns[col_index]
-                        return df[col_name].astype(str).str.replace('.', '-').tolist()
-            except Exception as e_wiki:
-                st.sidebar.warning(f"Wikipedia NASDAQ Scrape failed. Using internal database fallback... ({e_wiki})")
-                
-            return [
-                "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "AVGO", "PEP",
-                "COST", "ADBE", "CSCO", "NFLX", "AMD", "CMCSA", "TMUS", "TXN", "INTC", "AMGN",
-                "HON", "QCOM", "INTU", "SBUX", "AMAT", "ISRG", "MDLZ", "GILD", "LRCX", "BKNG",
-                "REGN", "VRTX", "ADP", "ADI", "PANW", "MU", "SNPS", "CDNS", "CSX", "ASML",
-                "MELI", "MAR", "KLAC", "CTAS", "ORLY", "MNST", "ROP", "LULU", "ADSK", "IDXX"
-            ]
-            
+            html_bytes = fetch_data_with_header('https://en.wikipedia.org/wiki/Nasdaq-100')
+            tables = pd.read_html(io.StringIO(html_bytes.decode('utf-8')))
+            for df in tables:
+                if 'Ticker' in df.columns or 'Symbol' in df.columns:
+                    return df['Ticker' if 'Ticker' in df.columns else 'Symbol'].tolist()
         elif market == "Penny Stocks (ต่ำกว่า $5)":
             return ["SNDL", "RIOT", "GRWG", "PLTR", "LCID", "SOFI", "NKLA", "DNA", "RIG", "MULN", "BBIG", "XELA"]
-            
         elif market == "SET100 (หุ้นไทย)":
             tickers = [
                 "ADVANC", "AOT", "AWC", "BANPU", "BBL", "BCP", "BDMS", "BEM", "BGRIM", "BH",
@@ -351,17 +348,13 @@ def load_market_tickers(market):
                 "TFG", "THANI", "THG", "TKN", "TOA", "TVO", "VGI", "WICE", "ITC", "SISB"
             ]
             return [t + ".BK" for t in tickers]
-            
         elif market == "SET50 (หุ้นไทย)":
             tickers = ["ADVANC", "AOT", "AWC", "BANPU", "BBL", "BDMS", "BEM", "BGRIM", "BH", "BTS", "CBG", "CENTEL", "COM7", "CPALL", "CPF", "CPN", "CRC", "DELTA", "EA", "EGCO", "GLOBAL", "GPSC", "GULF", "HMPRO", "INTUCH", "IRPC", "IVL", "JMART", "JMT", "KBANK", "KCE", "KTB", "KTC", "LH", "MINT", "MTC", "OR", "OSP", "PTT", "PTTEP", "PTTGC", "RATCH", "SAWAD", "SCB", "SCC", "SCGP", "TIDLOR", "TISCO", "TOP", "TRUE", "TTB", "TU", "WHA"]
             return [t + ".BK" for t in tickers]
-            
         elif market == "Crypto (Top Coins)":
             return ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOGE-USD", "TRX-USD", "DOT-USD"]
-            
         elif market == "Crypto (Alt/Meme Coins)":
             return ["SHIB-USD", "PEPE-USD", "WIF-USD", "FLOKI-USD", "BONK-USD", "MATIC-USD", "LINK-USD", "UNI-USD", "LTC-USD", "BCH-USD"]
-            
     except Exception as e: 
         st.sidebar.warning(f"Failed to fetch market data: {e}")
     return ['AAPL', 'MSFT', 'NVDA', 'AMZN'] # Fallback list
@@ -407,6 +400,7 @@ def scan_market_batch(tickers_list, is_penny=False):
     scan_pool = tickers_list
     tickers_str = " ".join(scan_pool)
     try:
+        # โหลดข้อมูลย้อนหลัง 3 เดือน เพื่อความแม่นยำและเสถียรภาพตัวชี้วัด (RSI14, RSI7, EMA20, EMA50)
         raw_df = yf.download(tickers_str, period="3mo", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=True)
         for ticker in scan_pool:
             try:
@@ -435,27 +429,27 @@ def scan_market_batch(tickers_list, is_penny=False):
                 df['BB_Lower'] = df['MA20'] - (df['STD'] * 2)
                 df['Vol_MA'] = volume.rolling(window=20).mean()
                 
-                # RSI 14
+                # RSI 14 (Welles Wilder Smoothing)
                 delta = close.diff()
                 gains = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
                 losses = -delta.where(delta < 0, 0).ewm(alpha=1/14, adjust=False).mean()
                 rs14 = gains / (losses + 1e-10)
                 df['RSI'] = 100 - (100 / (1 + rs14))
                 
-                # RSI 7
+                # RSI 7 (สำหรับจับโมเมนตัมระยะสั้นไวกว่า)
                 gains7 = delta.where(delta > 0, 0).ewm(alpha=1/7, adjust=False).mean()
                 losses7 = -delta.where(delta < 0, 0).ewm(alpha=1/7, adjust=False).mean()
                 rs7 = gains7 / (losses7 + 1e-10)
                 df['RSI7'] = 100 - (100 / (1 + rs7))
                 
-                # MACD
+                # MACD (12, 26, 9)
                 ema12 = close.ewm(span=12, adjust=False).mean()
                 ema26 = close.ewm(span=26, adjust=False).mean()
                 macd_line = ema12 - ema26
                 signal_line = macd_line.ewm(span=9, adjust=False).mean()
                 df['MACD_Hist'] = macd_line - signal_line
                 
-                # EMA Trend
+                # EMA Trend (20 / 50 วัน)
                 ema20 = close.ewm(span=20, adjust=False).mean()
                 ema50 = close.ewm(span=50, adjust=False).mean()
                 ema20_now, ema50_now = float(ema20.iloc[-1]), float(ema50.iloc[-1])
@@ -491,16 +485,30 @@ def scan_market_batch(tickers_list, is_penny=False):
                 high_20 = float(close.rolling(20).max().iloc[-1])
                 pct_from_high20 = round((c - high_20) / high_20 * 100, 2)
 
+                # ==========================================
+                # 🏷️ สร้างกลยุทธ์พิเศษแท็ก (Reversal Buy / Take Profit)
+                # ==========================================
                 strategy_tags = []
+                
+                # กลับตัวระยะสั้น: RSI7 เคยลงโซน Oversold (<30) ใน 3 วันก่อนหน้า และวันนี้เขียวดีดพ้นโซน
                 if (rsi7_prev3 < 30) and (rsi7 > rsi7_prev3) and (rsi7 < 50) and candle_is_green:
                     strategy_tags.append(("กลับตัวขึ้น (สั้น)", "reversal-short"))
+                
+                # กลับตัวระยะกลาง: EMA20 ตัดขึ้น EMA50 และ RSI14 เพิ่งฟื้นตัว (ยังไม่ Overbought) พร้อม MACD กำลังยกตัวขึ้น
                 if ema_bullish_cross and (35 < rsi14 < 60) and macd_rising:
                     strategy_tags.append(("กลับตัวขึ้น (กลาง)", "reversal-medium"))
+                    
+                # Take Profit สั้น: RSI7 ขึ้น Overbought และวันนี้เกิดแท่งแดงกลับตัวลงมา พร้อมราคาอยู่ในโซนใกล้ High 20 วัน
                 if (rsi7_prev3 > 70) and (rsi7 < rsi7_prev3) and candle_is_red and (pct_from_high20 > -5):
                     strategy_tags.append(("Take Profit (สั้น)", "takeprofit-short"))
+                    
+                # Take Profit กลาง: ราคาเกาะอยู่บนเทรนด์ขาขึ้นเหนือ EMA50 แต่ MACD Histogram ตัดลงตัดสัญญาณเริ่มแผ่วกำลัง
                 if above_ema_trend and macd_bearish_cross and (c > ema50_now):
                     strategy_tags.append(("Take Profit (กลาง)", "takeprofit-medium"))
 
+                # ==========================================
+                # 🔧 สัญญาณหลักมาตรฐาน
+                # ==========================================
                 signals = []
                 if rsi14 < 32:
                     signals.append(("RSI Oversold", "buy"))
@@ -520,6 +528,7 @@ def scan_market_batch(tickers_list, is_penny=False):
                 if vol_spike:
                     signals.append((f"Volume x{vol_ratio}", "vol"))
 
+                # บันทึกข้อมูลเฉพาะตัวที่มีแท็กสัญญาณหรือแท็กกลยุทธ์
                 if signals or strategy_tags:
                     results.append({
                         "ticker": ticker,
@@ -535,6 +544,7 @@ def scan_market_batch(tickers_list, is_penny=False):
                 print(f"Error scanning {ticker}: {e}")
                 continue
                 
+        # เรียงตามความเด่นของสัญญาณ
         results.sort(key=lambda x: x["signal_count"], reverse=True)
     except Exception as e:
         st.sidebar.error(f"เกิดข้อผิดพลาดในการสแกนตลาด: {e}")
@@ -576,6 +586,10 @@ def gemini_first_opinion(ticker, price_rounded, rsi_rounded, ma20_rounded, bb_u_
     - MACD Histogram: {macd_hist}
     
     ให้ความเห็นเบื้องต้นเชิงบวก/ลบ ตรวจสอบแรงส่งในตลาดและพฤติกรรมราคา เพื่อให้ Claude ตรวจสอบต่อไป
+
+    เขียนทุกฟิลด์ด้วยภาษาไทยง่ายๆ ประโยคสั้น อ่านครั้งเดียวเข้าใจทันที เหมือนเล่าให้เพื่อนที่ไม่ได้เรียนการเงินมาฟัง
+    ถ้าต้องพูดถึงศัพท์เทคนิค (เช่น RSI, MACD) ให้ขยายความสั้นๆในประโยคเดียวกันว่ามันแปลว่าอะไรในทางปฏิบัติ
+    ห้ามเขียนแบบทางการแข็งๆหรือฟังดูเหมือนแปลจากภาษาอังกฤษ
     """
     def run_gemini():
         response = client.models.generate_content(
@@ -585,7 +599,7 @@ def gemini_first_opinion(ticker, price_rounded, rsi_rounded, ma20_rounded, bb_u_
                 response_mime_type="application/json",
                 response_schema=GeminiOpinion,
                 temperature=0.4,
-                system_instruction="ตอบฟิลด์เป็นภาษาไทยทั้งหมดอย่างสั้น กระชับ คมคาย ได้สาระเชิงคณิตศาสตร์ทางเทคนิคการเงิน"
+                system_instruction="ตอบเป็นภาษาไทยล้วน ใช้ภาษาพูดธรรมดาที่คนทั่วไปอ่านครั้งเดียวแล้วเข้าใจ ไม่ต้องอ่านซ้ำ ประโยคสั้น กระชับ ตรงประเด็น หลีกเลี่ยงศัพท์เทคนิคที่ไม่จำเป็น ถ้าต้องใช้ศัพท์เฉพาะให้ขยายความสั้นๆในประโยคเดียวกันว่าหมายถึงอะไร ห้ามตอบแบบทางการแข็งๆหรือฟังดูเหมือนแปลจากภาษาอังกฤษ"
             )
         )
         return json.loads(response.text)
@@ -594,17 +608,23 @@ def gemini_first_opinion(ticker, price_rounded, rsi_rounded, ma20_rounded, bb_u_
 # ==========================================
 # 🤖 STEP 2 — CLAUDE: ตรวจสอบและให้ข้อยุติสุดท้าย
 # ==========================================
+@st.cache_data(ttl=3600)
 def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
+    """
+    Claude ตรวจทานข้อคิดเห็นเชิงลึก ท้าทายข้อมูลดิบ และสรุปสัญญาณเทรด Final
+    หากไม่มี ANTHROPIC_API_KEY หรือเกิดเหตุขัดข้อง จะทำการ Fallback คืนเป็นจำลอง Verdict อัตโนมัติด้วยโครงสร้างเดียวกัน
+    """
     if not ANTHROPIC_API_KEY:
+        # Fallback จำลอง Verdict อัตโนมัติจากโครงสร้างการคิดของ Gemini หากไม่มี Claude Key
         fallback_verdict = {
             "agrees_with_gemini": True,
-            "final_signal": gemini_opinion["initial_signal"] if gemini_opinion else "HOLD",
+            "final_signal": gemini_opinion["initial_signal"],
             "risk_level": "กลาง",
             "support_zone": f"{ind['ma20'] * 0.96:.2f}",
             "resistance_zone": f"{ind['ma20'] * 1.05:.2f}",
             "challenge_notes": f"ตรวจสอบโมเมนตัมของ {ticker} แล้วมีความสมเหตุสมผลตามโครงสร้าง RSI ระดับ {ind['rsi']}",
             "final_reasoning": f"มุมมองโดยรวมสอดคล้องกับปัจจัยแวดล้อมทาง Bollinger Bands แนะนำปฏิบัติตามกรอบราคาหลักอย่างระมัดระวัง",
-            "action_summary": f"ดำเนินการเล่นในกรอบแคบตามข้อบ่งชี้ {gemini_opinion['initial_signal'] if gemini_opinion else 'HOLD'} ในตลาดระยะสั้น",
+            "action_summary": f"ดำเนินการเล่นในกรอบแคบตามข้อบ่งชี้ {gemini_opinion['initial_signal']} ในตลาดระยะสั้น",
             "entry_price": f"{ind['price']:.2f}",
             "stop_loss": f"{ind['price'] * 0.95:.2f}",
             "take_profit": f"{ind['price'] * 1.10:.2f}",
@@ -616,16 +636,18 @@ def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
     prompt = f"""
     ตรวจสอบและตรวจทานพฤติกรรมกราฟราคารวมถึงความเห็นเบื้องต้นของ Gemini ของหุ้น {ticker}:
     - ข้อมูลเทคนิคัลดิบ: ราคาตลาด={ind['price']}, RSI={ind['rsi']}, MACD_Hist={ind['macd_hist']}, Bollinger=[{ind['bb_lower']}, {ind['bb_upper']}]
-    - ความเห็นแรกจาก Gemini: Sentiment={gemini_opinion['market_sentiment'] if gemini_opinion else 'N/A'}, Signal={gemini_opinion['initial_signal'] if gemini_opinion else 'HOLD'}, สังเกตเห็น={gemini_opinion['key_observation'] if gemini_opinion else 'N/A'}
+    - ความเห็นแรกจาก Gemini: Sentiment={gemini_opinion['market_sentiment']}, Signal={gemini_opinion['initial_signal']}, สังเกตเห็น={gemini_opinion['key_observation']}
     
-    จงตรวจสอบ ท้าทายข้อผิดพลาด และให้คำตัดสินและแผน Action Plan สุดท้าย (BUY / SELL / HOLD) ในระดับนักบริหารความเสี่ยงกองทุนระดับสากล
+    จงตรวจสอบ ท้าทายข้อผิดพลาด และให้คำตัดสินและแผน Action Plan สุดท้าย (BUY / SELL / HOLD) อย่างมีหลักการหนักแน่นแบบมือโปร
+    แต่เขียนคำอธิบายทุกข้อด้วยภาษาไทยง่ายๆ สั้น กระชับ อ่านครั้งเดียวเข้าใจ เหมือนอธิบายให้คนในครอบครัวที่ไม่ได้เรียนการเงินมาฟัง
+    หลีกเลี่ยงศัพท์การเงินที่ซับซ้อนเกินจำเป็น ถ้าต้องพูดถึงศัพท์เทคนิคให้ขยายความสั้นๆในประโยคเดียวกัน ห้ามเขียนแบบฟังดูเหมือนแปลจากภาษาอังกฤษ
     """
     
     def run_claude():
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,
-            system="คุณเป็นบอร์ดตัดสินใจเทรด ให้ตอบกลับเป็นรูปแบบ JSON เสมอเพื่อส่งคำตอบเข้าโครงสร้างระบบ",
+            system="คุณเป็นบอร์ดตัดสินใจเทรด ให้ตอบกลับเป็นรูปแบบ JSON เสมอเพื่อส่งคำตอบเข้าโครงสร้างระบบ ทุกข้อความในฟิลด์ต้องเป็นภาษาไทยง่ายๆที่อ่านแล้วเข้าใจทันที ไม่ใช้ประโยคที่ฟังดูเหมือนแปลจากภาษาอังกฤษ ไม่ใช้ศัพท์เทคนิคซ้อนศัพท์เทคนิคโดยไม่อธิบาย",
             messages=[{"role": "user", "content": prompt}],
             tools=[{
                 "name": "submit_verdict",
@@ -663,7 +685,7 @@ def get_ai_portfolio_analysis(portfolio_str):
                 response_mime_type="application/json",
                 response_schema=PortfolioAnalysisResult,
                 temperature=0.3,
-                system_instruction="คุณคือที่ปรึกษาทางการเงิน แนะนำการจัดพอร์ตให้คู่รักปลอดภัย เติบโตมั่นคง ตอบเป็นภาษาไทยทั้งหมดอย่างอบอุ่นและเป็นมิตร"
+                system_instruction="คุณคือที่ปรึกษาทางการเงิน แนะนำการจัดพอร์ตให้คู่รักปลอดภัย เติบโตมั่นคง ตอบเป็นภาษาไทยทั้งหมดอย่างอบอุ่นและเป็นมิตร ใช้ภาษาพูดง่ายๆ ประโยคสั้น ไม่ใช้ศัพท์การเงินซับซ้อน เหมือนคุยกับเพื่อนสนิท ไม่ใช่รายงานทางการ"
             )
         )
         return json.loads(response.text)
@@ -682,6 +704,7 @@ def ask_ai_copilot(query, ticker, price, tech_context, initial_analysis_str, cha
     คำถามผู้ใช้ล่าสุด: "{query}"
     
     จงวิเคราะห์ตอบข้อสงสัยให้ชัดเจนและอิงสถิติการลงทุน ปฏิบัติตอบภาษาไทย 100% สุภาพและเข้าใจง่าย
+    ตอบสั้น กระชับ เป็นกันเอง เหมือนเพื่อนนักลงทุนอธิบายให้เพื่อนฟัง หลีกเลี่ยงศัพท์เทคนิคพ่วงท้ายโดยไม่อธิบาย
     """
     def run_copilot():
         response = client.models.generate_content(
@@ -718,13 +741,6 @@ with st.sidebar:
         st.rerun()
         
     st.divider()
-    st.write("🔄 **ระบบดึงข้อมูลอัตโนมัติ (Live)**")
-    auto_refresh_enabled = st.checkbox("เปิด Auto Refresh หน้าร้าน", value=False)
-    if auto_refresh_enabled:
-        refresh_rate = st.slider("ความถี่ในการอัปเดตราคา (วินาที)", 10, 120, 30)
-        st.empty()
-    
-    st.divider()
     if not GEMINI_API_KEY:
         st.warning("⚠️ ยังไม่ได้ตั้งคีย์ GEMINI_API_KEY ใน Secrets")
     else:
@@ -753,8 +769,7 @@ if tv_symbol.startswith("SET:") and tv_interval in ["1", "5", "15", "60", "240"]
     tv_interval = "D"
     st.toast("⚠️ กราฟหุ้นไทย (SET) แสดงได้เฉพาะ Timeframe รายวัน (D) ขึ้นไป", icon="⏳")
 
-# ปรับค่า TTL ของ Cache ลงเหลือ 5 วินาที เพื่อจำลองราคาตลาดให้ตรงจริงตลอดเวลา
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=60)
 def get_main_ticker_data(t):
     try:
         quick_raw = yf.download(t, period="3mo", interval="1d", progress=False)
@@ -797,6 +812,7 @@ def get_main_ticker_data(t):
         return current_p, change_pct, rsi_v, ma20_v, bb_upper_v, bb_lower_v, macd_hist, vol_ratio
     except Exception as e:
         print(f"Fetch main data error for {t}: {e}")
+        st.toast(f"⚠️ ดึงข้อมูลราคาของ {t} ไม่สำเร็จ กำลังใช้ข้อมูลจำลองชั่วคราว", icon="⚠️")
         return 150.00, 0.0, 50.0, 150.0, 155.0, 145.0, 0.0, 1.0 # Dummy fallback
 
 current_p, change_pct, rsi_v, ma20_v, bb_upper_v, bb_lower_v, macd_hist, vol_ratio = get_main_ticker_data(ticker)
@@ -805,12 +821,7 @@ current_p, change_pct, rsi_v, ma20_v, bb_upper_v, bb_lower_v, macd_hist, vol_rat
 col_left_main, col_right_panel = st.columns([3, 1])
 
 with col_left_main:
-    st.markdown(f"""
-    #### 📈 Live Market Technical Chart: 
-    <span class="pulse-dot"></span><span style='color:#38bdf8;'>{ticker}</span> ({st.session_state.timeframe})
-    """, unsafe_allow_html=True)
-    
-    # ดึงวิดเจ็ตสตรีมมิ่งสดจาก TradingView แท้ ๆ รองรับ Websocket ดึงค่าสดตลอดเวลา
+    st.markdown(f"#### 📈 Live Market Technical Chart: <span style='color:#38bdf8;'>{ticker}</span> ({st.session_state.timeframe})", unsafe_allow_html=True)
     tradingview_html = f"""
     <div class="tradingview-widget-container" style="height:380px;width:100%">
       <div id="tradingview_chart" style="height:100%;width:100%"></div>
@@ -826,7 +837,6 @@ with col_left_main:
         "locale": "th",
         "enable_publishing": false,
         "hide_side_toolbar": false,
-        "allow_symbol_change": false,
         "studies": ["RSI@tv-basicstudies", "MASimple@tv-basicstudies"],
         "container_id": "tradingview_chart", "backgroundColor": "#0a0c10", "gridColor": "#232834"
       }});
@@ -835,7 +845,6 @@ with col_left_main:
     """
     components.html(tradingview_html, height=390)
 
-# คาดการณ์ความร้อนแรงรายวัน
 with col_right_panel:
     st.markdown("#### 🔥 ความร้อนแรงรายวัน")
     asset_select = st.selectbox("เลือกประเภทสินทรัพย์หลัก", ["US Stocks", "Thai Stocks", "Cryptocurrency"])
@@ -861,16 +870,17 @@ with col_right_panel:
 
 st.divider()
 
-# 2️⃣ BOTTOM SECTION: แท็บแยกโซนจัดการพอร์ตด้วยสไตล์ Fragment (ไม่รบกวนหน้ากราฟด้านบน!)
+
+# 2️⃣ BOTTOM SECTION: แท็บหน้าต่างแยกจัดการพอร์ต / สแกนเนอร์ และระบบ AI DEBATE
 st.markdown("### 💼 ระบบจัดการพอร์ต (แชร์ร่วมกัน) และสแกนเนอร์สมองกล")
 
-tab_us_class, tab_th_class, tab_crypto_class = st.tabs(["🇺🇸 หุ้นอเมริกา (US Stocks)", "🇹🇭 หุ้นไทย (Thai Stocks)", "🪙 คริปโทเคอร์เรนซี (Cryptocurrency)"])
+tab_us_class, tab_th_class, tab_crypto_class, tab_journal_class = st.tabs([
+    "🇺🇸 หุ้นอเมริกา (US Stocks)", "🇹🇭 หุ้นไทย (Thai Stocks)",
+    "🪙 คริปโทเคอร์เรนซี (Cryptocurrency)", "📓 Trade Journal & Win Rate"
+])
 
-# --- 🚀 บังคับใช้ @st.fragment แยกส่วนแบบอัจฉริยะ ---
-@st.fragment
-def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_list, default_scanned_df, is_penny=False, postfix=""):
-    # แถวที่ 1: แบ่งเป็น 2 คอลัมน์พรีเมียม (ตารางจัดการพอร์ตพากันโตคู่ และ AI สรุปผลเทรด)
-    col_p, col_a = st.columns([2.0, 1.3])
+def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, default_scanned_df, is_penny=False, postfix=""):
+    col_p, col_s, col_a = st.columns([1.5, 1.0, 1.1])
     
     with col_p:
         st.markdown(f"##### 📋 ตารางพอร์ตครอบครัว ({postfix})")
@@ -943,6 +953,79 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                     except Exception as e:
                         st.error(f"การดึงราคา Real-time ล้มเหลว: {e}")
                         
+    with col_s:
+        st.markdown("##### 🔍 ตัวเลือกสแกนตลาดสมองกล")
+        scanner_type = st.selectbox("เลือกดัชนีคัดกรองเฉพาะด้าน:", scanner_market_list, key=f"select_scan_{portfolio_key}")
+        
+        if st.button("🚀 ยิงพิกัดสแกนตรวจจับสัญญาณด่วน", key=f"btn_scan_{portfolio_key}", use_container_width=True, type="primary"):
+            st.session_state.scan_results = []
+            with st.spinner("สมองกลกำลังกวาดดัชนีชี้วัดเทคนิคอลและจับแท็กกลยุทธ์หุ้นทั้งหมด (อาจใช้เวลาสักครู่)..."):
+                t_list = load_market_tickers(scanner_type)
+                results = scan_market_batch(t_list, is_penny=(scanner_type == "Penny Stocks (ต่ำกว่า $5)"))
+                st.session_state.scan_results = results
+                st.toast(f"อัปเดตระบบตรวจสอบสัญญาณสแกนเนอร์สำเร็จ! พบสัญญาณ {len(results)} ตัว", icon="🔥")
+                st.rerun()
+                
+        st.write("📋 **สัญญาณด่วนและแท็กกลยุทธ์ที่ตรวจพบล่าสุด:**")
+        df_s = pd.DataFrame(st.session_state.scan_results) if st.session_state.scan_results else default_scanned_df
+            
+        if not df_s.empty:
+            # แปลงและจัดรูปแบบเพื่อให้พ่นข้อมูลพร้อม Tag สวยงามบนตาราง
+            tag_class_map = {
+                "reversal-short": "tag-reversal-short",
+                "reversal-medium": "tag-reversal-medium",
+                "takeprofit-short": "tag-takeprofit-short",
+                "takeprofit-medium": "tag-takeprofit-medium",
+            }
+            tag_icon_map = {
+                "reversal-short": "🟢", "reversal-medium": "🟢",
+                "takeprofit-short": "🟠", "takeprofit-medium": "🟠",
+            }
+            
+            # วนซ้ำพ่นรายการเพื่อให้ดูง่ายพร้อมปุ่มคลิกวิเคราะห์
+            for idx, r in df_s.iterrows():
+                t_ticker = r.get("ticker", r.get("Ticker", "Unknown"))
+                t_price = r.get("price", r.get("Price", 0.0))
+                t_change = r.get("change_pct", 0.0)
+                
+                # ประกอบ HTML ย่อยของสัญญาณ
+                strategy_html = ""
+                if "strategy_tags" in r and isinstance(r["strategy_tags"], list):
+                    for label, kind in r["strategy_tags"]:
+                        cls = tag_class_map.get(kind, "tag-reversal-short")
+                        icon = tag_icon_map.get(kind, "")
+                        strategy_html += f'<span class="strategy-tag {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{icon} {label}</span>'
+                
+                badge_html = ""
+                if "signals" in r and isinstance(r["signals"], list):
+                    for label, kind in r["signals"]:
+                        cls = {"buy": "badge-buy", "sell": "badge-sell", "neutral": "badge-neutral", "vol": "badge-vol"}.get(kind, "badge-neutral")
+                        badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{label}</span>'
+                elif "Signal" in r:
+                    # Fallback ของเดิม
+                    lbl = r["Signal"]
+                    cls = "badge-buy" if "BUY" in lbl else "badge-sell" if "RSI Over" in lbl else "badge-neutral"
+                    badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{lbl}</span>'
+                
+                c1, c2 = st.columns([2.5, 1.0])
+                with c1:
+                    change_color = "var(--green)" if t_change >= 0 else "var(--red)"
+                    st.markdown(f"""
+                    <div style="line-height:1.2;">
+                        <strong>{t_ticker}</strong> <span style="color:{change_color}; font-size:0.8rem;">${t_price} ({t_change:+.2f}%)</span>
+                        <div style="margin-top: 4px;">{strategy_html}{badge_html}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with c2:
+                    if st.button("วิเคราะห์ →", key=f"btn_sel_{t_ticker}_{portfolio_key}", use_container_width=True):
+                        st.session_state.active_ticker = t_ticker
+                        st.session_state.ai_debate_result = None
+                        st.session_state.chat_history = []
+                        st.rerun()
+                st.markdown("<div style='border-top:1px solid #1e293b; margin:6px 0;'></div>", unsafe_allow_html=True)
+        else:
+            st.info("💡 ไม่พบสัญญาณตลาด แนะนำกวาดสแกนด้วยตนเอง")
+                
     with col_a:
         st.markdown("##### 🧠 AI Debate & Portfolio Expert")
         tab_sub_st, tab_sub_port = st.tabs(["วิเคราะห์โต้ตอบ Debate", "พอร์ตครอบครัว"])
@@ -966,6 +1049,7 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                 else:
                     with st.spinner("AI กำลังโต้วาทะประมวลผล (Gemini กำลังร่างความเห็นแรก)..."):
                         try:
+                            # คำนวณรวบรวม Indicators ดิบ
                             ind_data = {
                                 "price": current_p,
                                 "change_pct": change_pct,
@@ -978,6 +1062,7 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                             }
                             st.session_state.ai_debate_result = run_ai_debate(ticker, ind_data)
                             st.session_state.chat_history = []
+                            journal.log_verdict(ticker, st.session_state.ai_debate_result["claude"])  # 📓 บันทึกลง Trade Journal
                         except Exception as e:
                             st.error(str(e))
                             
@@ -986,7 +1071,8 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                 g = res_deb["gemini"]
                 c = res_deb["claude"]
                 
-                signal_upper = c.get("final_signal", "HOLD").upper() if c else "HOLD"
+                # แถบผลสรุปหลัก
+                signal_upper = c.get("final_signal", "HOLD").upper()
                 banner_class = "buy" if signal_upper == "BUY" else "sell" if signal_upper == "SELL" else "hold"
                 icon = "🟢" if banner_class == "buy" else "🔴" if banner_class == "sell" else "🟡"
                 action_label = {"buy": "ซื้อ (BUY)", "sell": "ขาย (SELL)", "hold": "ถือครอง (HOLD)"}[banner_class]
@@ -994,36 +1080,40 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                 st.markdown(f"""
                 <div style="background: linear-gradient(90deg, rgba(201,168,106,0.15), rgba(201,168,106,0.02)); border: 1.5px solid var(--verdict); border-radius: 8px; padding: 10px; margin-bottom:12px;">
                     <div style="font-weight:bold; color:var(--verdict); font-size:0.9rem;">{icon} คำแนะนำสุดท้าย: {action_label}</div>
-                    <div style="font-size:0.8rem; color:#cbd5e1; margin-top:4px;">{c.get('action_summary', '') if c else ''}</div>
+                    <div style="font-size:0.8rem; color:#cbd5e1; margin-top:4px;">{c.get('action_summary', '')}</div>
                 </div>
                 """, unsafe_allow_html=True)
                 
+                # สรุปดีเบตจำลองความเห็นย่อย
                 with st.expander("🔍 ดูบทวิพากษ์และข้อท้าทาย (Gemini vs Claude)"):
-                    agree_class = "pill-agree" if c and c.get("agrees_with_gemini") else "pill-disagree"
-                    agree_text = "เห็นด้วย" if c and c.get("agrees_with_gemini") else "ท้าทายแย้งข้อคิดเห็น"
+                    agree_class = "pill-agree" if c.get("agrees_with_gemini") else "pill-disagree"
+                    agree_text = "เห็นด้วย" if c.get("agrees_with_gemini") else "ท้าทายแย้งข้อคิดเห็น"
                     
                     st.markdown(f"""
                     <div style="font-size:0.8rem;">
-                        <p><strong style="color:var(--gemini);">Gemini Opinion:</strong> {g.get('market_sentiment', '-') if g else '-'}</p>
-                        <p><strong style="color:var(--claude);">Claude Challenge:</strong> {c.get('challenge_notes', '-') if c else '-'}</p>
+                        <p><strong style="color:var(--gemini);">Gemini Opinion:</strong> {g.get('market_sentiment', '-')}</p>
+                        <p><strong style="color:var(--claude);">Claude Challenge:</strong> {c.get('challenge_notes', '-')}</p>
                         <span class="pill {agree_class}">{agree_text}</span>
-                        <span class="pill">ความเสี่ยง: {c.get('risk_level', '-') if c else '-'}</span>
+                        <span class="pill">ความเสี่ยง: {c.get('risk_level', '-')}</span>
                     </div>
                     """, unsafe_allow_html=True)
                 
+                # พิกัด Verdict Action Plan
+                signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(signal_upper, "signal-hold")
                 st.markdown(f"""
                 <div class="verdict-box" style="padding:12px; margin-top:8px;">
-                    <div style="font-size:0.75rem; color:var(--verdict); font-weight:bold;">🛡 {c.get('support_zone', '-') if c else '-'} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c.get('resistance_zone', '-') if c else '-'}</div>
+                    <div style="font-size:0.75rem; color:var(--verdict); font-weight:bold;">🛡 {c.get('support_zone', '-')} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c.get('resistance_zone', '-')}</div>
                     <div class="plan-grid" style="margin-top:6px; gap:8px;">
-                        <div class="plan-cell entry" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">จุดเข้าซื้อ</div><div class="plan-value" style="font-size:0.8rem;">{c.get('entry_price', '-') if c else '-'}</div></div>
-                        <div class="plan-cell stop" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Stop Loss</div><div class="plan-value" style="font-size:0.8rem;">{c.get('stop_loss', '-') if c else '-'}</div></div>
-                        <div class="plan-cell target" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Take Profit</div><div class="plan-value" style="font-size:0.8rem;">{c.get('take_profit', '-') if c else '-'}</div></div>
+                        <div class="plan-cell entry" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">จุดเข้าซื้อ</div><div class="plan-value" style="font-size:0.8rem;">{c.get('entry_price', '-')}</div></div>
+                        <div class="plan-cell stop" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Stop Loss</div><div class="plan-value" style="font-size:0.8rem;">{c.get('stop_loss', '-')}</div></div>
+                        <div class="plan-cell target" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Take Profit</div><div class="plan-value" style="font-size:0.8rem;">{c.get('take_profit', '-')}</div></div>
                     </div>
-                    <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px; line-height:1.3;"><strong>เหตุผลสรุป:</strong> {c.get('final_reasoning', '-') if c else '-'}</div>
-                    <div style="font-size:0.7rem; color:#7b8494; margin-top:4px;">💼 {c.get('position_sizing_note', '-') if c else '-'}</div>
+                    <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px; line-height:1.3;"><strong>เหตุผลสรุป:</strong> {c.get('final_reasoning', '-')}</div>
+                    <div style="font-size:0.7rem; color:#7b8494; margin-top:4px;">💼 {c.get('position_sizing_note', '-')}</div>
                 </div>
                 """, unsafe_allow_html=True)
                 
+                # ส่วนแชทสืบถามเพิ่มเติมกับ AI Copilot
                 st.divider()
                 st.write("💬 **ถาม-ตอบโต้ตอบ AI Copilot:**")
                 for chat in st.session_state.chat_history:
@@ -1035,7 +1125,7 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                     user_query = st.text_input("ปรึกษาโมเมนตัมเพิ่มเติม:", key=f"input_query_{portfolio_key}")
                     if st.form_submit_button("ส่งคำถาม") and user_query:
                         tech_c = f"RSI={rsi_v:.1f}, MACD_Hist={macd_hist:.4f}"
-                        ai_orig = f"Verdict={c.get('final_signal', '') if c else ''}, Entry={c.get('entry_price', '') if c else ''}, TP={c.get('take_profit', '') if c else ''}"
+                        ai_orig = f"Verdict={c.get('final_signal', '')}, Entry={c.get('entry_price', '')}, TP={c.get('take_profit', '')}"
                         with st.spinner("AI กำลังวิเคราะห์..."):
                             copilot_ans = ask_ai_copilot(user_query, ticker, current_p, tech_c, ai_orig, st.session_state.chat_history)
                         st.session_state.chat_history.extend([
@@ -1066,90 +1156,72 @@ def render_portfolio_and_scanner_area_fragment(portfolio_key, scanner_market_lis
                 st.markdown(f"""<div style="background-color: #1e1b29; border-left: 4px solid #a855f7; padding: 10px; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1;"><strong>💡 แนะนำอนาคตพอร์ตครอบครัว:</strong><br>{p_res.get('strategic_advice', '-')}</div>""", unsafe_allow_html=True)
             else:
                 st.info("💡 คลิกเพื่อประเมินความเสี่ยงพอร์ตร่วมกันของแฟน")
-
-    # -------------------------------------------------------------
-    # แถวที่ 2: สแกนเนอร์สมองกล (ย้ายมาอยู่แถวด้านล่างสุด มีขนาดกว้างเต็มจอ)
-    # -------------------------------------------------------------
-    st.markdown("<div style='border-top:1px solid #1e293b; margin:28px 0 16px 0;'></div>", unsafe_allow_html=True)
-    st.markdown(f"##### 🔍 ระบบสแกนตลาดสมองกลคัดกรองสัญญาณด่วน ({postfix})")
     
-    col_scan_ctrl, col_scan_display = st.columns([1.0, 2.3])
-    
-    with col_scan_ctrl:
-        scanner_type = st.selectbox("เลือกดัชนีคัดกรองเฉพาะด้าน:", scanner_market_list, key=f"select_scan_{portfolio_key}")
-        
-        if st.button("🚀 ยิงพิกัดสแกนตรวจจับสัญญาณด่วน", key=f"btn_scan_{portfolio_key}", use_container_width=True, type="primary"):
-            st.session_state.scan_results = []
-            with st.spinner("สมองกลกำลังกวาดดัชนีชี้วัดเทคนิคอลและจับแท็กกลยุทธ์หุ้นทั้งหมด..."):
-                t_list = load_market_tickers(scanner_type)
-                results = scan_market_batch(t_list, is_penny=(scanner_type == "Penny Stocks (ต่ำกว่า $5)"))
-                st.session_state.scan_results = results
-                st.toast(f"อัปเดตระบบตรวจสอบสัญญาณสแกนเนอร์สำเร็จ! พบสัญญาณ {len(results)} ตัว", icon="🔥")
-                st.rerun()
-                
-    with col_scan_display:
-        st.write("📋 **สัญญาณด่วนและแท็กกลยุทธ์ที่ตรวจพบล่าสุด:**")
-        df_s = pd.DataFrame(st.session_state.scan_results) if st.session_state.scan_results else default_scanned_df
-            
-        if not df_s.empty:
-            # ใช้เลย์เอาต์ย่อยแบ่งคอลัมน์ภายในเพื่อกระจายหุ้นสแกนออกด้านกว้าง ไม่ให้เปลืองพื้นที่แนวตั้ง
-            cols_grid = st.columns(2)
-            
-            tag_class_map = {
-                "reversal-short": "tag-reversal-short",
-                "reversal-medium": "tag-reversal-medium",
-                "takeprofit-short": "tag-takeprofit-short",
-                "takeprofit-medium": "tag-takeprofit-medium",
-            }
-            tag_icon_map = {
-                "reversal-short": "🟢", "reversal-medium": "🟢",
-                "takeprofit-short": "🟠", "takeprofit-medium": "🟠",
-            }
-            
-            for idx, r in df_s.reset_index(drop=True).iterrows():
-                # สลับการแสดงผลหุ้นซ้าย-ขวา
-                target_col = cols_grid[idx % 2]
-                
-                t_ticker = r.get("ticker", r.get("Ticker", "Unknown"))
-                t_price = r.get("price", r.get("Price", 0.0))
-                t_change = r.get("change_pct", 0.0)
-                
-                strategy_html = ""
-                if "strategy_tags" in r and isinstance(r["strategy_tags"], list):
-                    for label, kind in r["strategy_tags"]:
-                        cls = tag_class_map.get(kind, "tag-reversal-short")
-                        icon = tag_icon_map.get(kind, "")
-                        strategy_html += f'<span class="strategy-tag {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{icon} {label}</span>'
-                
-                badge_html = ""
-                if "signals" in r and isinstance(r["signals"], list):
-                    for label, kind in r["signals"]:
-                        cls = {"buy": "badge-buy", "sell": "badge-sell", "neutral": "badge-neutral", "vol": "badge-vol"}.get(kind, "badge-neutral")
-                        badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{label}</span>'
-                
-                with target_col:
-                    c1, c2 = st.columns([2.5, 1.0])
-                    with c1:
-                        change_color = "var(--green)" if t_change >= 0 else "var(--red)"
-                        st.markdown(f"""
-                        <div style="line-height:1.2; margin-bottom: 8px;">
-                            <strong>{t_ticker}</strong> <span style="color:{change_color}; font-size:0.8rem;">${t_price} ({t_change:+.2f}%)</span>
-                            <div style="margin-top: 4px;">{strategy_html}{badge_html}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    with c2:
-                        if st.button("วิเคราะห์ →", key=f"btn_sel_{t_ticker}_{portfolio_key}_{idx}", use_container_width=True):
-                            st.session_state.active_ticker = t_ticker
-                            st.session_state.ai_debate_result = None
-                            st.session_state.chat_history = []
-                            st.rerun() 
-                    st.markdown("<div style='border-top:1px solid #1e293b; margin:6px 0;'></div>", unsafe_allow_html=True)
-        else:
-            st.info("💡 ไม่พบสัญญาณตลาด แนะนำกวาดสแกนด้วยตนเอง")
+# ==========================================
+# 📓 TRADE JOURNAL & WIN-RATE TAB
+# ==========================================
+def render_trade_journal_tab():
+    st.markdown("##### 📓 Trade Journal — ติดตามผลจริงของคำตัดสิน AI ย้อนหลัง")
+    st.caption("ทุกครั้งที่กด '▶ เริ่มกระบวนการ AI Debate' ระบบจะบันทึก verdict ของ Claude ไว้ที่นี่อัตโนมัติ "
+               "แล้วกดปุ่มด้านล่างเพื่อเช็คกับราคาจริงว่าผลลัพธ์เป็นยังไง")
 
-# ดำเนินการกระจายหน้าตามแท็บคลาสต่างๆ โดยเรียกใช้ Fragment ฟังก์ชันแยกจากกัน
+    col_btn, col_note = st.columns([1, 2])
+    with col_btn:
+        if st.button("🔄 อัปเดตผลย้อนหลัง (เช็คราคาจริง)", use_container_width=True, type="primary"):
+            with st.spinner("กำลังเช็คราคาย้อนหลังเทียบกับ Take Profit / Stop Loss ของแต่ละรายการ..."):
+                updated, errors = journal.settle_journal_entries()
+            if errors:
+                st.warning(f"อัปเดตสำเร็จ {updated} รายการ มีบางตัวดึงราคาไม่สำเร็จ {errors} รายการ (ลองกดใหม่ได้)")
+            else:
+                st.toast(f"อัปเดตผลสำเร็จ {updated} รายการ", icon="✅")
+            st.rerun()
+    with col_note:
+        st.caption("⚠️ การเช็คนี้ต้องดึงราคาย้อนหลังของทุก ticker ที่ยังไม่ปิดสถานะ อาจใช้เวลาสักครู่ถ้ามีรายการเยอะ")
+
+    stats = journal.get_win_rate_stats()
+
+    st.divider()
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("บันทึกทั้งหมด", stats["total"])
+    s2.metric("ยังเปิดอยู่", stats["open"])
+    s3.metric("ชนะ", stats["win"])
+    s4.metric("แพ้", stats["loss"])
+    win_rate_display = f"{stats['win_rate_pct']}%" if stats["win_rate_pct"] is not None else "ยังไม่มีข้อมูล"
+    s5.metric("Win Rate", win_rate_display)
+
+    if stats["win_rate_pct"] is None:
+        st.info("💡 ยังไม่มีรายการที่ปิดสถานะแพ้/ชนะ ลองใช้งาน AI Debate สักพักแล้วกลับมากดอัปเดตผลย้อนหลังอีกครั้ง")
+
+    if not stats["by_signal"].empty:
+        st.write("**Win Rate แยกตามประเภทสัญญาณ:**")
+        for _, row in stats["by_signal"].iterrows():
+            st.markdown(f"- **{row['final_signal']}**: {row['win_rate_pct']}% (จากที่ตัดสินผลแล้ว {row['n']} ครั้ง)")
+
+    st.divider()
+    st.write("**📋 รายการล่าสุด:**")
+    recent = journal.get_recent_entries(limit=30)
+    if recent.empty:
+        st.info("💡 ยังไม่มีรายการในสมุดบันทึก — ไปลองกด AI Debate ที่หุ้นตัวไหนก็ได้ดูครับ")
+    else:
+        outcome_label = {
+            "win": "✅ ชนะ", "loss": "❌ แพ้", "pending": "⏳ รอผล",
+            "expired": "⌛ หมดอายุ", "not_applicable": "➖ ไม่นับ (HOLD)"
+        }
+        display_df = recent.copy()
+        display_df["ผลลัพธ์"] = display_df["outcome"].map(outcome_label).fillna(display_df["outcome"])
+        display_df = display_df[[
+            "ticker", "created_at", "final_signal", "entry_price",
+            "stop_loss", "take_profit", "ผลลัพธ์"
+        ]].rename(columns={
+            "ticker": "หุ้น", "created_at": "วันที่บันทึก", "final_signal": "สัญญาณ",
+            "entry_price": "เข้าซื้อ", "stop_loss": "Stop Loss", "take_profit": "Take Profit"
+        })
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+# ดำเนินการกระจายหน้าตามแท็บคลาสต่างๆ
 with tab_us_class:
-    render_portfolio_and_scanner_area_fragment(
+    render_portfolio_and_scanner_area(
         "port_us", ["NASDAQ 100", "S&P 500", "Penny Stocks (ต่ำกว่า $5)"],
         pd.DataFrame([
             {"ticker": "AAPL", "price": 180.25, "change_pct": 1.2, "strategy_tags": [("กลับตัวขึ้น (กลาง)", "reversal-medium")], "signals": [("MACD GoldCross", "buy")]}
@@ -1157,7 +1229,7 @@ with tab_us_class:
     )
 
 with tab_th_class:
-    render_portfolio_and_scanner_area_fragment(
+    render_portfolio_and_scanner_area(
         "port_th", ["SET100 (หุ้นไทย)", "SET50 (หุ้นไทย)"],
         pd.DataFrame([
             {"ticker": "PTT.BK", "price": 32.50, "change_pct": -0.8, "strategy_tags": [("กลับตัวขึ้น (สั้น)", "reversal-short")], "signals": [("RSI Oversold", "buy")]}
@@ -1165,18 +1237,16 @@ with tab_th_class:
     )
 
 with tab_crypto_class:
-    render_portfolio_and_scanner_area_fragment(
+    render_portfolio_and_scanner_area(
         "port_crypto", ["Crypto (Top Coins)", "Crypto (Alt/Meme Coins)"],
         pd.DataFrame([
             {"ticker": "BTC-USD", "price": 61500.00, "change_pct": 2.5, "strategy_tags": [("กลับตัวขึ้น (กลาง)", "reversal-medium")], "signals": [("BB Breakout บน", "buy")]}
         ]), postfix="Crypto"
     )
 
-# เพิ่มระบบ Auto-Refresh (ถ้าเปิดใช้งาน)
-if auto_refresh_enabled:
-    time.sleep(refresh_rate)
-    st.rerun()
+with tab_journal_class:
+    render_trade_journal_tab()
 
 st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>"
-            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ claude-sonnet 4.6 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
+            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ Claude Sonnet 4.6 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
             "</div>", unsafe_allow_html=True)
