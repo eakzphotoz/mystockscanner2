@@ -1104,69 +1104,73 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                     "ลองเปลี่ยนดัชนีคัดกรอง หรือมาเช็คใหม่อีกครั้งวันหลัง")
 
         if not df_s.empty:
-            # แปลงและจัดรูปแบบเพื่อให้พ่นข้อมูลพร้อม Tag สวยงามบนตาราง
-            tag_class_map = {
-                "reversal-short": "tag-reversal-short",
-                "reversal-medium": "tag-reversal-medium",
-                "takeprofit-short": "tag-takeprofit-short",
-                "takeprofit-medium": "tag-takeprofit-medium",
-            }
-            tag_icon_map = {
-                "reversal-short": "🟢", "reversal-medium": "🟢",
-                "takeprofit-short": "🟠", "takeprofit-medium": "🟠",
-            }
-            
-            # วนซ้ำพ่นรายการเพื่อให้ดูง่ายพร้อมปุ่มคลิกวิเคราะห์
-            for idx, r in df_s.iterrows():
-                t_ticker = r.get("ticker", r.get("Ticker", "Unknown"))
-                t_price = r.get("price", r.get("Price", 0.0))
-                t_change = r.get("change_pct", 0.0)
-                
-                # ประกอบ HTML ย่อยของสัญญาณ
-                strategy_html = ""
-                if "strategy_tags" in r and isinstance(r["strategy_tags"], list):
-                    for label, kind in r["strategy_tags"]:
-                        cls = tag_class_map.get(kind, "tag-reversal-short")
-                        icon = tag_icon_map.get(kind, "")
-                        strategy_html += f'<span class="strategy-tag {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{icon} {label}</span>'
-                
-                badge_html = ""
-                if "signals" in r and isinstance(r["signals"], list):
-                    for label, kind in r["signals"]:
-                        cls = {"buy": "badge-buy", "sell": "badge-sell", "neutral": "badge-neutral", "vol": "badge-vol"}.get(kind, "badge-neutral")
-                        badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{label}</span>'
-                elif "Signal" in r:
-                    # Fallback ของเดิม
-                    lbl = r["Signal"]
-                    cls = "badge-buy" if "BUY" in lbl else "badge-sell" if "RSI Over" in lbl else "badge-neutral"
-                    badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{lbl}</span>'
+            # รวบรวมแท็ก/สัญญาณทั้งหมดที่เจอในรอบนี้ ทำเป็นตัวเลือกกรองกลุ่ม (เช่น "กลับตัวขึ้น (สั้น)", "BB Breakout บน")
+            all_tags = set()
+            for _, r in df_s.iterrows():
+                if isinstance(r.get("strategy_tags"), list):
+                    all_tags.update(label for label, kind in r["strategy_tags"])
+                if isinstance(r.get("signals"), list):
+                    all_tags.update(label for label, kind in r["signals"])
 
-                quality_html = ""
-                if r.get("quality_flag"):
-                    qf = r["quality_flag"]
-                    qcolor = {"ปกติ": "#22c55e", "ระมัดระวังสูง": "#ef4444", "ไม่แน่ใจ": "#94a3b8"}.get(qf, "#94a3b8")
-                    qicon = {"ปกติ": "✅", "ระมัดระวังสูง": "⚠️", "ไม่แน่ใจ": "❔"}.get(qf, "")
-                    qreason = r.get("quality_reason", "")
-                    quality_html = (f'<div style="margin-top:4px; font-size:0.68rem; color:{qcolor};">'
-                                     f'{qicon} AI ประเมินคุณภาพ: {qf}{" — " + qreason if qreason else ""}</div>')
-                
-                c1, c2 = st.columns([2.5, 1.0])
-                with c1:
-                    change_color = "var(--green)" if t_change >= 0 else "var(--red)"
-                    st.markdown(f"""
-                    <div style="line-height:1.2;">
-                        <strong>{t_ticker}</strong> <span style="color:{change_color}; font-size:0.8rem;">${t_price} ({t_change:+.2f}%)</span>
-                        <div style="margin-top: 4px;">{strategy_html}{badge_html}</div>
-                        {quality_html}
-                    </div>
-                    """, unsafe_allow_html=True)
-                with c2:
-                    if st.button("วิเคราะห์ →", key=f"btn_sel_{t_ticker}_{portfolio_key}", use_container_width=True):
-                        st.session_state.active_ticker = t_ticker
+            f_col1, f_col2 = st.columns([1.2, 1])
+            with f_col1:
+                selected_tag = st.selectbox("🏷️ กรองตามแท็ก/สัญญาณ (ดูเป็นกลุ่มๆ):",
+                                             ["ทั้งหมด"] + sorted(all_tags), key=f"tag_filter_{portfolio_key}")
+            with f_col2:
+                st.caption("💡 คลิกหัวคอลัมน์ในตารางด้านล่างเพื่อเรียงลำดับได้เลย (เช่น คลิก 'ราคา')")
+
+            table_rows = []
+            for _, r in df_s.iterrows():
+                tags_list = [label for label, kind in r["strategy_tags"]] if isinstance(r.get("strategy_tags"), list) else []
+                sig_list = [label for label, kind in r["signals"]] if isinstance(r.get("signals"), list) else []
+                combined_tags = tags_list + sig_list
+                if selected_tag != "ทั้งหมด" and selected_tag not in combined_tags:
+                    continue
+                change = r.get("change_pct", 0.0)
+                table_rows.append({
+                    "ticker": r.get("ticker", r.get("Ticker", "Unknown")),
+                    "price": r.get("price", r.get("Price", 0.0)),
+                    "change_str": f"🟢 +{change:.2f}%" if change >= 0 else f"🔴 {change:.2f}%",
+                    "tags": ", ".join(combined_tags) if combined_tags else "-",
+                    "quality": r.get("quality_flag", ""),
+                    "quality_reason": r.get("quality_reason", ""),
+                })
+
+            if not table_rows:
+                st.info('ไม่พบหุ้นที่ตรงกับแท็กที่เลือก ลองเลือก "ทั้งหมด" ดูครับ')
+            else:
+                quality_label_map = {"ปกติ": "✅ ปกติ", "ระมัดระวังสูง": "⚠️ ระมัดระวังสูง", "ไม่แน่ใจ": "❔ ไม่แน่ใจ"}
+                display_df = pd.DataFrame([{
+                    "หุ้น": row["ticker"],
+                    "ราคา ($)": row["price"],
+                    "% เปลี่ยน": row["change_str"],
+                    "แท็ก/สัญญาณ": row["tags"],
+                    "AI คุณภาพ": quality_label_map.get(row["quality"], "-") if row["quality"] else "-",
+                } for row in table_rows])
+
+                table_height = min(38 * (len(display_df) + 1) + 3, 420)
+                st.dataframe(display_df, use_container_width=True, hide_index=True, height=table_height)
+
+                # แยกเหตุผลของ AI เฉพาะตัวที่เตือน "ระมัดระวังสูง" ไว้ในกล่องพับเก็บ ไม่ให้ตารางหลักรกเกินไป
+                warn_rows = [row for row in table_rows if row["quality"] == "ระมัดระวังสูง" and row["quality_reason"]]
+                if warn_rows:
+                    with st.expander(f"⚠️ ดูเหตุผลที่ AI เตือนระมัดระวังสูง ({len(warn_rows)} ตัว)"):
+                        for row in warn_rows:
+                            st.markdown(f"- **{row['ticker']}**: {row['quality_reason']}")
+
+                sel_col1, sel_col2 = st.columns([2, 1])
+                with sel_col1:
+                    ticker_choices = [row["ticker"] for row in table_rows]
+                    selected_for_analysis = st.selectbox("เลือกหุ้นที่จะวิเคราะห์ต่อ:", ticker_choices,
+                                                          key=f"select_analyze_{portfolio_key}_{selected_tag}")
+                with sel_col2:
+                    st.write("")
+                    if st.button("🔍 วิเคราะห์ →", key=f"btn_table_sel_{portfolio_key}",
+                                 use_container_width=True, type="primary"):
+                        st.session_state.active_ticker = selected_for_analysis
                         st.session_state.ai_debate_result = None
                         st.session_state.chat_history = []
                         st.rerun()
-                st.markdown("<div style='border-top:1px solid #1e293b; margin:6px 0;'></div>", unsafe_allow_html=True)
         else:
             st.info("💡 ไม่พบสัญญาณตลาด แนะนำกวาดสแกนด้วยตนเอง")
                 
