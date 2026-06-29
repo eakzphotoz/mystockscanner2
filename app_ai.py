@@ -82,12 +82,18 @@ def init_db():
     conn.close()
 
 def load_portfolio(table_name):
-    """อ่านข้อมูลพอร์ตจาก SQLite เป็น DataFrame"""
+    """
+    อ่านข้อมูลพอร์ตจาก SQLite เป็น DataFrame
+    Normalize Ticker เป็นตัวพิมพ์ใหญ่เสมอ เพราะ yfinance/Yahoo คืนคอลัมน์ราคาเป็นตัวพิมพ์ใหญ่
+    ถ้าไม่ normalize ตรงนี้ การจับคู่หาราคาตลาดจะพังเงียบๆ (ตกไปใช้ AvgCost แทนโดยไม่มี error)
+    """
     try:
         _validate_table_name(table_name)
         conn = sqlite3.connect(DB_FILE)
         df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
         conn.close()
+        if not df.empty and "Ticker" in df.columns:
+            df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
         return df
     except Exception as e:
         st.error(f"Database Load Error ({table_name}): {e}")
@@ -109,7 +115,7 @@ def save_portfolio(table_name, df):
         cursor = conn.cursor()
 
         clean_df = df.dropna(subset=["Ticker"]).copy()
-        clean_df["Ticker"] = clean_df["Ticker"].astype(str).str.strip()
+        clean_df["Ticker"] = clean_df["Ticker"].astype(str).str.strip().str.upper()
         clean_df = clean_df[clean_df["Ticker"] != ""]
 
         current_tickers = set(clean_df["Ticker"].tolist())
@@ -180,11 +186,17 @@ class PortfolioAnalysisResult(BaseModel):
     portfolio_pnl_summary: str
     strategic_advice: str
 
+class PennyStockQualityItem(BaseModel):
+    ticker: str
+    quality_flag: str   # "ปกติ" / "ระมัดระวังสูง" / "ไม่แน่ใจ"
+    reason: str          # เหตุผลสั้นๆ 1 ประโยค
+
+class PennyStockQualityBatch(BaseModel):
+    assessments: list[PennyStockQualityItem]
+
 # --- 🔄 ระบบจำข้อมูลและสถานะเว็บ ---
 if 'active_ticker' not in st.session_state:
     st.session_state.active_ticker = "AAPL"
-if 'scan_results' not in st.session_state:
-    st.session_state.scan_results = []
 if 'ai_debate_result' not in st.session_state:
     st.session_state.ai_debate_result = None
 if 'ai_portfolio_analysis' not in st.session_state:
@@ -320,12 +332,45 @@ def fetch_data_with_header(url):
     with urllib.request.urlopen(req) as response: 
         return response.read()
 
+@st.cache_data(ttl=86400)  # cache 1 วัน รายชื่อหุ้นที่จดทะเบียนไม่เปลี่ยนบ่อย
+def fetch_nasdaq_universe():
+    """
+    ดึงรายชื่อหุ้นทั้งหมดที่จดทะเบียนบน NASDAQ จากไฟล์ทางการของ NASDAQ Trader (ฟรี ไม่ต้องขอ API key)
+    ใช้เป็น "universe" จริงสำหรับสุ่มสแกนหา Penny Stocks แทนการพึ่งรายชื่อคัดมือที่ตายตัวและเก่าได้ง่าย
+    """
+    try:
+        raw_bytes = fetch_data_with_header('https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt')
+        text = raw_bytes.decode('utf-8')
+        df = pd.read_csv(io.StringIO(text), sep='|')
+        df = df[df['Test Issue'] == 'N']  # ตัดหุ้นทดสอบระบบ ไม่ใช่หุ้นจริง
+        if 'ETF' in df.columns:
+            df = df[df['ETF'] == 'N']     # ตัด ETF ออก เอาแต่หุ้นรายตัว
+        symbols = df['Symbol'].dropna().tolist()
+        # ตัด symbol ที่มีตัวอักษรพิเศษ (เช่น warrant/unit ของ SPAC ที่มี . หรือ - ติดมา) เอาแต่หุ้นสามัญทั่วไป
+        symbols = [s for s in symbols if isinstance(s, str) and s.isalpha() and 1 <= len(s) <= 5]
+        return symbols
+    except Exception as e:
+        print(f"Failed to fetch NASDAQ universe: {e}")
+        return []
+
 @st.cache_data(ttl=86400) # Cache 1 วันสำหรับรายชื่อหุ้น
 def load_market_tickers(market):
     try:
         if market == "S&P 500":
             csv_bytes = fetch_data_with_header('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv')
             return pd.read_csv(io.BytesIO(csv_bytes))['Symbol'].tolist()
+        elif market == "Penny Stocks (สแกนทั้งตลาด NASDAQ + AI กรองคุณภาพ)":
+            # โหมดนี้ดึง universe หุ้นจริงทั้งหมดที่จดทะเบียนบน NASDAQ (~3,000-4,000 ตัว) แล้วสุ่มหยิบมาเช็คราคาจริง
+            # ครอบคลุมกว้างกว่ารายชื่อคัดมือ แต่ใช้เวลาสแกนนานขึ้น และผลลัพธ์แต่ละรอบอาจไม่ซ้ำกัน เพราะสุ่มใหม่ทุกครั้ง
+            # หมายเหตุ: เช็คเงื่อนไขนี้ก่อน "NASDAQ" in market ด้านล่าง เพราะ string นี้มีคำว่า NASDAQ ปนอยู่ด้วย
+            # ถ้าสลับลำดับจะถูกเงื่อนไขด้านล่างตัดหน้าไปสแกน NASDAQ-100 ผิดจุดประสงค์
+            universe = fetch_nasdaq_universe()
+            if not universe:
+                # ดึง universe ไม่ได้ (เช่น เน็ตมีปัญหา) ใช้กลุ่มตัวอย่างคัดมือเป็น fallback ไม่ให้สแกนพัง
+                return ["SNDL", "CGC", "ACB", "TLRY", "CRON", "OGI", "GRWG", "FCEL", "PLUG", "BLNK",
+                        "WKHS", "RIG", "LCID", "OCGN", "INO", "VXRT", "CLOV", "OPEN", "BBAI", "IVDA", "INUV", "GRAB", "IQ"]
+            sample_size = min(250, len(universe))
+            return random.sample(universe, sample_size)
         elif "NASDAQ" in market:
             html_bytes = fetch_data_with_header('https://en.wikipedia.org/wiki/Nasdaq-100')
             tables = pd.read_html(io.StringIO(html_bytes.decode('utf-8')))
@@ -333,7 +378,19 @@ def load_market_tickers(market):
                 if 'Ticker' in df.columns or 'Symbol' in df.columns:
                     return df['Ticker' if 'Ticker' in df.columns else 'Symbol'].tolist()
         elif market == "Penny Stocks (ต่ำกว่า $5)":
-            return ["SNDL", "RIOT", "GRWG", "PLTR", "LCID", "SOFI", "NKLA", "DNA", "RIG", "MULN", "BBIG", "XELA"]
+            # หมายเหตุสำคัญ: นี่ไม่ใช่ "รายชื่อ penny stock ตายตัว" แต่เป็น "กลุ่มตัวอย่างหุ้นจากหลายเซกเตอร์
+            # ที่ในอดีตมักมีราคาต่ำกว่า $5 อยู่เป็นประจำ" (กัญชา, พลังงานสะอาด/EV เล็ก, ไบโอเทค, ฟินเทค, ADR จีน)
+            # ตัวกรอง is_penny ใน scan_market_batch จะเช็คราคา ณ ปัจจุบันจริงและคัดตัวที่เกิน $5 ออกอัตโนมัติ
+            # ขยายกลุ่มให้กว้างขึ้นเพื่อให้มีโอกาสสูงที่จะมีตัวเหลือผ่านเกณฑ์เสมอ แม้บางตัวจะ "โต" หลุดเกณฑ์ไปแล้ว
+            # แนะนำให้กลับมาทบทวน/เพิ่มรายชื่อใหม่เป็นระยะ เพราะนี่ยังเป็นกลุ่มตัวอย่างที่คัดมือ ไม่ใช่การสแกนทั้งตลาดจริง
+            return [
+                "SNDL", "CGC", "ACB", "TLRY", "CRON", "OGI",                  # กัญชา
+                "GRWG", "FCEL", "PLUG", "BLNK", "WKHS",                       # พลังงานสะอาด/EV เล็ก
+                "RIG", "LCID",                                                # พลังงาน/EV
+                "OCGN", "INO", "VXRT",                                       # ไบโอเทค
+                "CLOV", "OPEN", "BBAI", "IVDA", "INUV",                       # ฟินเทค/AI/พร็อพเทค
+                "GRAB", "IQ"                                                  # ADR ต่างประเทศ
+            ]
         elif market == "SET100 (หุ้นไทย)":
             tickers = [
                 "ADVANC", "AOT", "AWC", "BANPU", "BBL", "BCP", "BDMS", "BEM", "BGRIM", "BH",
@@ -567,6 +624,52 @@ def call_api_with_backoff(api_call_fn, *args, **kwargs):
             "⚠️ บริการ AI กำลังมีผู้ใช้งานหนาแน่นชั่วคราว (Error 503 / High Demand) "
             "ระบบพยายามออโต้รีไทร์ 5 ครั้งแล้วยังไม่สำเร็จ กรุณาเว้นระยะ 15 วินาทีแล้วกดปุ่มคำนวณอีกครั้งครับ"
         )
+
+# ==========================================
+# 🛡️ AI QUALITY SCREEN สำหรับ Penny Stocks ที่มาจากการสแกนทั้งตลาด
+# ==========================================
+@st.cache_data(ttl=3600)
+def ai_quality_filter_penny_stocks(tickers_tuple):
+    """
+    ให้ Gemini ช่วยประเมินความเสี่ยงเชิงคุณภาพของหุ้น Penny ที่ผ่านตัวกรองราคา+เทคนิคมาแล้ว จากความรู้ทั่วไป
+    ที่โมเดลมีอยู่ (ไม่ใช่การเช็คข้อมูลสด) เพื่อติดป้ายเตือนเสริมให้ผู้ใช้ระมัดระวังเป็นพิเศษกับตัวที่มีประวัติเสี่ยงสูง
+    (เช่น reverse split ถี่ๆ, เคยใกล้ delist/ล้มละลาย) — เป็นป้ายเตือนเสริมเท่านั้น ไม่ใช่การฟันธงแนะนำซื้อ/ขาย
+    และไม่ได้แทนที่การตรวจสอบข้อมูลจริงก่อนลงทุน
+    """
+    if not GEMINI_API_KEY or not tickers_tuple:
+        return {}
+    tickers = list(tickers_tuple)
+    ticker_list_str = ", ".join(tickers)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f"""
+    นี่คือรายชื่อหุ้นที่ราคาต่ำกว่า $5 และมีสัญญาณเทคนิคบางอย่างเกิดขึ้นตอนนี้: {ticker_list_str}
+
+    จากความรู้ทั่วไปที่คุณมีเกี่ยวกับแต่ละบริษัทนี้ (ไม่ต้องเดาราคาหรือเช็คข้อมูลสด) ช่วยประเมินว่าตัวไหนมีสัญญาณเตือน
+    เชิงคุณภาพที่นักลงทุนทั่วไปควรรู้ก่อนเป็นพิเศษหรือไม่ เช่น มีประวัติ reverse stock split ถี่ๆ, เคยใกล้ delist
+    หรือล้มละลาย, เป็นบริษัท pre-revenue ที่ขาดทุนสะสมมหาศาลต่อเนื่องยาวนาน, หรือมีประวัติด่างพร้อยเรื่องการเปิดเผยข้อมูล
+
+    ตอบให้ครบทุกตัวที่ให้มา ติดป้าย quality_flag เป็นค่าใดค่าหนึ่งเท่านั้น: "ปกติ", "ระมัดระวังสูง", หรือ "ไม่แน่ใจ"
+    ใช้ "ไม่แน่ใจ" ถ้าไม่มีข้อมูลเกี่ยวกับบริษัทนี้เพียงพอ ห้ามเดามั่ว พร้อมเหตุผลสั้นๆไม่เกิน 1 ประโยคเป็นภาษาไทยง่ายๆ
+    """
+    def run_quality_check():
+        response = client.models.generate_content(
+            model='gemini-3.1-flash-lite',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=PennyStockQualityBatch,
+                temperature=0.2,
+                system_instruction="ตอบเป็นภาษาไทยล้วน ใช้ภาษาง่ายๆสั้นกระชับ ประเมินจากความรู้ทั่วไปเท่านั้น "
+                                    "ไม่ทำนายราคาหรืออนาคต ถ้าไม่รู้จักบริษัทให้ตอบว่าไม่แน่ใจตรงๆ ห้ามเดามั่ว"
+            )
+        )
+        return json.loads(response.text)
+    try:
+        data = call_api_with_backoff(run_quality_check)
+        return {item["ticker"].upper(): item for item in data.get("assessments", [])}
+    except Exception as e:
+        print(f"AI quality filter error: {e}")
+        return {}
 
 # ==========================================
 # 🤖 STEP 1 — GEMINI: ความเห็นแรก
@@ -880,6 +983,15 @@ tab_us_class, tab_th_class, tab_crypto_class, tab_journal_class = st.tabs([
 ])
 
 def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, default_scanned_df, is_penny=False, postfix=""):
+    # เก็บผลสแกนแยกตามแท็บ (portfolio_key) ไม่ใช้ key กลางร่วมกันทุกแท็บแบบเดิม
+    # เพื่อกัน "สแกนหุ้นไทยแล้วไปโผล่ในแท็บคริปโต" และเพื่อแยกแยะ "ยังไม่กดสแกน" กับ "สแกนแล้วแต่ไม่พบ" ได้ถูกต้อง
+    scan_results_key = f"scan_results_{portfolio_key}"
+    scan_has_run_key = f"scan_has_run_{portfolio_key}"
+    if scan_results_key not in st.session_state:
+        st.session_state[scan_results_key] = []
+    if scan_has_run_key not in st.session_state:
+        st.session_state[scan_has_run_key] = False
+
     col_p, col_s, col_a = st.columns([1.5, 1.0, 1.1])
     
     with col_p:
@@ -894,6 +1006,9 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
         )
         
         if not edited_port.equals(st.session_state[portfolio_key]):
+            edited_port["Ticker"] = edited_port["Ticker"].apply(
+                lambda x: str(x).strip().upper() if pd.notna(x) else x
+            )
             st.session_state[portfolio_key] = edited_port
             save_portfolio(portfolio_key, edited_port)
             st.toast(f"บันทึกข้อมูลพอร์ต {postfix} ลงฐานข้อมูลแล้ว", icon="💾")
@@ -958,17 +1073,36 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
         scanner_type = st.selectbox("เลือกดัชนีคัดกรองเฉพาะด้าน:", scanner_market_list, key=f"select_scan_{portfolio_key}")
         
         if st.button("🚀 ยิงพิกัดสแกนตรวจจับสัญญาณด่วน", key=f"btn_scan_{portfolio_key}", use_container_width=True, type="primary"):
-            st.session_state.scan_results = []
-            with st.spinner("สมองกลกำลังกวาดดัชนีชี้วัดเทคนิคอลและจับแท็กกลยุทธ์หุ้นทั้งหมด (อาจใช้เวลาสักครู่)..."):
+            is_universe_scan = (scanner_type == "Penny Stocks (สแกนทั้งตลาด NASDAQ + AI กรองคุณภาพ)")
+            is_penny_mode = is_universe_scan or (scanner_type == "Penny Stocks (ต่ำกว่า $5)")
+            spinner_msg = ("สมองกลกำลังกวาดหุ้นสุ่มจากทั้งตลาด NASDAQ (อาจใช้เวลานานกว่าปกติ)..." if is_universe_scan
+                           else "สมองกลกำลังกวาดดัชนีชี้วัดเทคนิคอลและจับแท็กกลยุทธ์หุ้นทั้งหมด (อาจใช้เวลาสักครู่)...")
+            with st.spinner(spinner_msg):
                 t_list = load_market_tickers(scanner_type)
-                results = scan_market_batch(t_list, is_penny=(scanner_type == "Penny Stocks (ต่ำกว่า $5)"))
-                st.session_state.scan_results = results
+                results = scan_market_batch(t_list, is_penny=is_penny_mode)
+
+                if is_universe_scan and results:
+                    with st.spinner(f"AI กำลังตรวจสอบคุณภาพหุ้นที่เจอเพิ่มเติม ({len(results)} ตัว)..."):
+                        quality_map = ai_quality_filter_penny_stocks(tuple(r["ticker"] for r in results))
+                    for r in results:
+                        q = quality_map.get(str(r["ticker"]).upper())
+                        if q:
+                            r["quality_flag"] = q.get("quality_flag")
+                            r["quality_reason"] = q.get("reason")
+
+                st.session_state[scan_results_key] = results
+                st.session_state[scan_has_run_key] = True
                 st.toast(f"อัปเดตระบบตรวจสอบสัญญาณสแกนเนอร์สำเร็จ! พบสัญญาณ {len(results)} ตัว", icon="🔥")
                 st.rerun()
                 
         st.write("📋 **สัญญาณด่วนและแท็กกลยุทธ์ที่ตรวจพบล่าสุด:**")
-        df_s = pd.DataFrame(st.session_state.scan_results) if st.session_state.scan_results else default_scanned_df
-            
+        has_run = st.session_state[scan_has_run_key]
+        df_s = pd.DataFrame(st.session_state[scan_results_key]) if has_run else default_scanned_df
+
+        if has_run and df_s.empty:
+            st.info("🔍 ไม่พบหุ้นที่ตรงกับเงื่อนไขการสแกนรอบนี้ — อาจเป็นเพราะดัชนีนี้ไม่มีตัวไหนเข้าเงื่อนไขตอนนี้ "
+                    "ลองเปลี่ยนดัชนีคัดกรอง หรือมาเช็คใหม่อีกครั้งวันหลัง")
+
         if not df_s.empty:
             # แปลงและจัดรูปแบบเพื่อให้พ่นข้อมูลพร้อม Tag สวยงามบนตาราง
             tag_class_map = {
@@ -1006,6 +1140,15 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                     lbl = r["Signal"]
                     cls = "badge-buy" if "BUY" in lbl else "badge-sell" if "RSI Over" in lbl else "badge-neutral"
                     badge_html += f'<span class="scan-badge {cls}" style="padding: 1px 6px; font-size: 0.65rem; border-radius: 4px; font-weight: bold; margin-right: 4px;">{lbl}</span>'
+
+                quality_html = ""
+                if r.get("quality_flag"):
+                    qf = r["quality_flag"]
+                    qcolor = {"ปกติ": "#22c55e", "ระมัดระวังสูง": "#ef4444", "ไม่แน่ใจ": "#94a3b8"}.get(qf, "#94a3b8")
+                    qicon = {"ปกติ": "✅", "ระมัดระวังสูง": "⚠️", "ไม่แน่ใจ": "❔"}.get(qf, "")
+                    qreason = r.get("quality_reason", "")
+                    quality_html = (f'<div style="margin-top:4px; font-size:0.68rem; color:{qcolor};">'
+                                     f'{qicon} AI ประเมินคุณภาพ: {qf}{" — " + qreason if qreason else ""}</div>')
                 
                 c1, c2 = st.columns([2.5, 1.0])
                 with c1:
@@ -1014,6 +1157,7 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                     <div style="line-height:1.2;">
                         <strong>{t_ticker}</strong> <span style="color:{change_color}; font-size:0.8rem;">${t_price} ({t_change:+.2f}%)</span>
                         <div style="margin-top: 4px;">{strategy_html}{badge_html}</div>
+                        {quality_html}
                     </div>
                     """, unsafe_allow_html=True)
                 with c2:
@@ -1222,7 +1366,7 @@ def render_trade_journal_tab():
 # ดำเนินการกระจายหน้าตามแท็บคลาสต่างๆ
 with tab_us_class:
     render_portfolio_and_scanner_area(
-        "port_us", ["NASDAQ 100", "S&P 500", "Penny Stocks (ต่ำกว่า $5)"],
+        "port_us", ["NASDAQ 100", "S&P 500", "Penny Stocks (ต่ำกว่า $5)", "Penny Stocks (สแกนทั้งตลาด NASDAQ + AI กรองคุณภาพ)"],
         pd.DataFrame([
             {"ticker": "AAPL", "price": 180.25, "change_pct": 1.2, "strategy_tags": [("กลับตัวขึ้น (กลาง)", "reversal-medium")], "signals": [("MACD GoldCross", "buy")]}
         ]), postfix="US Stocks"
