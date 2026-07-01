@@ -748,7 +748,7 @@ def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
     
     def run_claude():
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=2048,
             system="คุณเป็นบอร์ดตัดสินใจเทรด ให้ตอบกลับเป็นรูปแบบ JSON เสมอเพื่อส่งคำตอบเข้าโครงสร้างระบบ ทุกข้อความในฟิลด์ต้องเป็นภาษาไทยง่ายๆที่อ่านแล้วเข้าใจทันที ไม่ใช้ประโยคที่ฟังดูเหมือนแปลจากภาษาอังกฤษ ไม่ใช้ศัพท์เทคนิคซ้อนศัพท์เทคนิคโดยไม่อธิบาย",
             messages=[{"role": "user", "content": prompt}],
@@ -782,7 +782,7 @@ def get_ai_portfolio_analysis(portfolio_str):
     prompt = f"วิเคราะห์ภาพรวมและการกระจายความเสี่ยงพอร์ตครอบครัวของคู่รัก:\n{portfolio_str}"
     def run_portfolio():
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.1-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -811,7 +811,7 @@ def ask_ai_copilot(query, ticker, price, tech_context, initial_analysis_str, cha
     """
     def run_copilot():
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.1-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.5)
         )
