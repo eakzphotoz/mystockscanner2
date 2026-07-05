@@ -631,11 +631,12 @@ def call_api_with_backoff(api_call_fn, *args, **kwargs):
 # 🛡️ AI QUALITY SCREEN สำหรับ Penny Stocks ที่มาจากการสแกนทั้งตลาด
 # ==========================================
 @st.cache_data(ttl=3600)
-def ai_quality_filter_penny_stocks(tickers_tuple):
+def ai_quality_filter_stocks(tickers_tuple):
     """
-    ให้ Gemini ช่วยประเมินความเสี่ยงเชิงคุณภาพของหุ้น Penny ที่ผ่านตัวกรองราคา+เทคนิคมาแล้ว จากความรู้ทั่วไป
+    ให้ Gemini ช่วยประเมินความเสี่ยงเชิงคุณภาพของหุ้นที่ผ่านตัวกรองเทคนิคมาแล้ว จากความรู้ทั่วไป
     ที่โมเดลมีอยู่ (ไม่ใช่การเช็คข้อมูลสด) เพื่อติดป้ายเตือนเสริมให้ผู้ใช้ระมัดระวังเป็นพิเศษกับตัวที่มีประวัติเสี่ยงสูง
-    (เช่น reverse split ถี่ๆ, เคยใกล้ delist/ล้มละลาย) — เป็นป้ายเตือนเสริมเท่านั้น ไม่ใช่การฟันธงแนะนำซื้อ/ขาย
+    (เช่น reverse split ถี่ๆ, เคยใกล้ delist/ล้มละลาย, หนี้สินสูงผิดปกติ, ประเด็นบัญชี/ธรรมาภิบาล)
+    ใช้ได้กับหุ้นทุกขนาด ไม่จำกัดแค่ penny stock — เป็นป้ายเตือนเสริมเท่านั้น ไม่ใช่การฟันธงแนะนำซื้อ/ขาย
     และไม่ได้แทนที่การตรวจสอบข้อมูลจริงก่อนลงทุน
     """
     if not GEMINI_API_KEY or not tickers_tuple:
@@ -644,11 +645,12 @@ def ai_quality_filter_penny_stocks(tickers_tuple):
     ticker_list_str = ", ".join(tickers)
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = f"""
-    นี่คือรายชื่อหุ้นที่ราคาต่ำกว่า $5 และมีสัญญาณเทคนิคบางอย่างเกิดขึ้นตอนนี้: {ticker_list_str}
+    นี่คือรายชื่อหุ้นที่มีสัญญาณเทคนิคบางอย่างเกิดขึ้นตอนนี้: {ticker_list_str}
 
     จากความรู้ทั่วไปที่คุณมีเกี่ยวกับแต่ละบริษัทนี้ (ไม่ต้องเดาราคาหรือเช็คข้อมูลสด) ช่วยประเมินว่าตัวไหนมีสัญญาณเตือน
     เชิงคุณภาพที่นักลงทุนทั่วไปควรรู้ก่อนเป็นพิเศษหรือไม่ เช่น มีประวัติ reverse stock split ถี่ๆ, เคยใกล้ delist
-    หรือล้มละลาย, เป็นบริษัท pre-revenue ที่ขาดทุนสะสมมหาศาลต่อเนื่องยาวนาน, หรือมีประวัติด่างพร้อยเรื่องการเปิดเผยข้อมูล
+    หรือล้มละลาย, หนี้สินสูงผิดปกติเทียบรายได้, มีประเด็นบัญชี/ธรรมาภิบาลที่เป็นข่าวมาก่อน, หรือเป็นบริษัท
+    pre-revenue ที่ขาดทุนสะสมมหาศาลต่อเนื่องยาวนาน — ถ้าเป็นหุ้นบริษัทใหญ่ที่มั่นคงปกติ ให้ตอบว่า "ปกติ" ตรงไปตรงมา
 
     ตอบให้ครบทุกตัวที่ให้มา ติดป้าย quality_flag เป็นค่าใดค่าหนึ่งเท่านั้น: "ปกติ", "ระมัดระวังสูง", หรือ "ไม่แน่ใจ"
     ใช้ "ไม่แน่ใจ" ถ้าไม่มีข้อมูลเกี่ยวกับบริษัทนี้เพียงพอ ห้ามเดามั่ว พร้อมเหตุผลสั้นๆไม่เกิน 1 ประโยคเป็นภาษาไทยง่ายๆ
@@ -1014,7 +1016,7 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
     if scan_has_run_key not in st.session_state:
         st.session_state[scan_has_run_key] = False
 
-    col_p, col_s, col_a = st.columns([1.5, 1.0, 1.1])
+    col_p, col_s, col_a = st.columns([1.0, 1.7, 0.9])
     
     with col_p:
         st.markdown(f"##### 📋 ตารางพอร์ตครอบครัว ({postfix})")
@@ -1093,6 +1095,10 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
     with col_s:
         st.markdown("##### 🔍 ตัวเลือกสแกนตลาดสมองกล")
         scanner_type = st.selectbox("เลือกดัชนีคัดกรองเฉพาะด้าน:", scanner_market_list, key=f"select_scan_{portfolio_key}")
+        use_ai_quality = st.checkbox(
+            "🛡️ ให้ AI ช่วยประเมินคุณภาพหุ้นที่เจอเพิ่มเติม (ใช้ Gemini เพิ่ม 1 รอบ อาจช้าลงนิดหน่อย)",
+            value=False, key=f"ai_quality_{portfolio_key}"
+        )
         
         if st.button("🚀 ยิงพิกัดสแกนตรวจจับสัญญาณด่วน", key=f"btn_scan_{portfolio_key}", use_container_width=True, type="primary"):
             is_universe_scan = (scanner_type == "Penny Stocks (สแกนทั้งตลาด NASDAQ + AI กรองคุณภาพ)")
@@ -1103,9 +1109,10 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                 t_list = load_market_tickers(scanner_type)
                 results = scan_market_batch(t_list, is_penny=is_penny_mode)
 
-                if is_universe_scan and results:
+                run_quality_check = is_universe_scan or use_ai_quality  # 🛡️ universe scan บังคับเช็คอยู่แล้ว หรือผู้ใช้ติ๊กเลือกเอง
+                if run_quality_check and results:
                     with st.spinner(f"AI กำลังตรวจสอบคุณภาพหุ้นที่เจอเพิ่มเติม ({len(results)} ตัว)..."):
-                        quality_map = ai_quality_filter_penny_stocks(tuple(r["ticker"] for r in results))
+                        quality_map = ai_quality_filter_stocks(tuple(r["ticker"] for r in results))
                     for r in results:
                         q = quality_map.get(str(r["ticker"]).upper())
                         if q:
