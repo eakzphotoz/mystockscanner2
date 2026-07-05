@@ -22,6 +22,7 @@ except ImportError:
     pass  # รองรับเผื่อบางสภาพแวดล้อมไม่มีไลบรารี anthropic
 
 import journal  # 📓 โมดูลใหม่: Trade Journal + Win-Rate (แยกไฟล์ ไม่กระทบโค้ดเดิม)
+import news  # 📰 โมดูลใหม่: News Sentiment (แยกไฟล์ ใช้ DB เดียวกัน ไม่กระทบโค้ดเดิม)
 
 # --- ⚙️ การตั้งค่าหน้าเว็บ (Premium Dark Theme) ---
 st.set_page_config(
@@ -156,6 +157,7 @@ else:
         init_db()
 
 journal.init_journal_db()  # 📓 สร้างตาราง trade_journal ถ้ายังไม่มี (ปลอดภัย ใช้ IF NOT EXISTS)
+news.init_news_db()  # 📰 สร้างตาราง news_flags ถ้ายังไม่มี (ปลอดภัย ใช้ IF NOT EXISTS)
 
 # ==========================================
 # 📊 SCHEMAS & MODELS FOR DEBATE
@@ -709,10 +711,27 @@ def gemini_first_opinion(ticker, price_rounded, rsi_rounded, ma20_rounded, bb_u_
     return call_api_with_backoff(run_gemini)
 
 # ==========================================
+# 📰 NEWS — ดึงข่าว+sentiment ล่าสุด (cache 1 ชม. กันยิงซ้ำทุกครั้งที่ rerun หน้าเว็บ)
+# ==========================================
+@st.cache_data(ttl=3600)
+def get_news_context_cached(ticker):
+    """ดึง+วิเคราะห์ข่าวใหม่ (ถ้ายังไม่มีข่าวใน DB ช่วง 48 ชม.ล่าสุด) แล้วคืนข้อความสรุปสำหรับแปะใน prompt ของ Claude"""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    existing = news.get_latest_flags(ticker)
+    if not existing:
+        try:
+            news.refresh_news(ticker, ANTHROPIC_API_KEY)
+        except Exception as e:
+            print(f"[news] refresh_news error for {ticker}: {e}")
+    return news.get_news_context(ticker)
+
+
+# ==========================================
 # 🤖 STEP 2 — CLAUDE: ตรวจสอบและให้ข้อยุติสุดท้าย
 # ==========================================
 @st.cache_data(ttl=3600)
-def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
+def claude_challenge_and_verdict(ticker, ind, gemini_opinion, news_context=""):
     """
     Claude ตรวจทานข้อคิดเห็นเชิงลึก ท้าทายข้อมูลดิบ และสรุปสัญญาณเทรด Final
     หากไม่มี ANTHROPIC_API_KEY หรือเกิดเหตุขัดข้อง จะทำการ Fallback คืนเป็นจำลอง Verdict อัตโนมัติด้วยโครงสร้างเดียวกัน
@@ -736,11 +755,12 @@ def claude_challenge_and_verdict(ticker, ind, gemini_opinion):
         return fallback_verdict
         
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    news_section = f"\n    {news_context}\n    (ถ้าข่าวข้างต้นสวนทางกับสัญญาณเทคนิค ให้พิจารณาว่าข่าวเพิ่งเกิดอาจมีน้ำหนักกว่าสัญญาณเทคนิคที่เป็นข้อมูลย้อนหลัง)\n    " if news_context else ""
     prompt = f"""
     ตรวจสอบและตรวจทานพฤติกรรมกราฟราคารวมถึงความเห็นเบื้องต้นของ Gemini ของหุ้น {ticker}:
     - ข้อมูลเทคนิคัลดิบ: ราคาตลาด={ind['price']}, RSI={ind['rsi']}, MACD_Hist={ind['macd_hist']}, Bollinger=[{ind['bb_lower']}, {ind['bb_upper']}]
     - ความเห็นแรกจาก Gemini: Sentiment={gemini_opinion['market_sentiment']}, Signal={gemini_opinion['initial_signal']}, สังเกตเห็น={gemini_opinion['key_observation']}
-    
+    {news_section}
     จงตรวจสอบ ท้าทายข้อผิดพลาด และให้คำตัดสินและแผน Action Plan สุดท้าย (BUY / SELL / HOLD) อย่างมีหลักการหนักแน่นแบบมือโปร
     แต่เขียนคำอธิบายทุกข้อด้วยภาษาไทยง่ายๆ สั้น กระชับ อ่านครั้งเดียวเข้าใจ เหมือนอธิบายให้คนในครอบครัวที่ไม่ได้เรียนการเงินมาฟัง
     หลีกเลี่ยงศัพท์การเงินที่ซับซ้อนเกินจำเป็น ถ้าต้องพูดถึงศัพท์เทคนิคให้ขยายความสั้นๆในประโยคเดียวกัน ห้ามเขียนแบบฟังดูเหมือนแปลจากภาษาอังกฤษ
@@ -771,8 +791,10 @@ def run_ai_debate(ticker, ind):
         ticker, round(ind['price'], 2), round(ind['rsi'], 0), round(ind['ma20'], 2), 
         round(ind['bb_upper'], 2), round(ind['bb_lower'], 2), round(ind['macd_hist'], 4)
     )
-    claude_v = claude_challenge_and_verdict(ticker, ind, gemini_op)
-    return {"gemini": gemini_op, "claude": claude_v, "indicators": ind, "ticker": ticker}
+    news_context = get_news_context_cached(ticker)  # 📰 ดึง+วิเคราะห์ข่าวล่าสุด ก่อนให้ Claude ตัดสิน
+    claude_v = claude_challenge_and_verdict(ticker, ind, gemini_op, news_context)
+    return {"gemini": gemini_op, "claude": claude_v, "indicators": ind, "ticker": ticker,
+            "news_flags": news.get_latest_flags(ticker)}
 
 @st.cache_data(ttl=900)
 def get_ai_portfolio_analysis(portfolio_str):
@@ -1190,7 +1212,17 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            
+
+            # 📰 โชว์ badge ข่าวล่าสุด (จาก DB เดิม ไม่ยิง API ใหม่ ไม่กระทบความเร็วหน้าเว็บ)
+            _news_flags_preview = news.get_latest_flags(ticker)
+            if _news_flags_preview:
+                _sent_icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}
+                _badge_html = " ".join(
+                    f'<span class="pill" title="{f["reasoning"]}">{_sent_icon.get(f["sentiment"], "⚪")} {f["headline"][:40]}{"…" if len(f["headline"]) > 40 else ""}</span>'
+                    for f in _news_flags_preview[:3]
+                )
+                st.markdown(f'<div style="margin-bottom:8px;">{_badge_html}</div>', unsafe_allow_html=True)
+
             if st.button("▶ เริ่มกระบวนการ AI Debate วิจัยด่วน", key=f"btn_ai_st_{portfolio_key}", use_container_width=True, type="primary"):
                 if not GEMINI_API_KEY:
                     st.error("กรุณากรอก GEMINI_API_KEY ใน secrets")
