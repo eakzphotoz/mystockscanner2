@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_lightweight_charts import renderLightweightCharts
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -182,12 +183,6 @@ class ClaudeVerdict(BaseModel):
     take_profit: str            # เป้ากำไร
     position_sizing_note: str   # คำแนะนำเรื่องการบริหารความเสี่ยง
 
-class PortfolioAnalysisResult(BaseModel):
-    diversification_score: str
-    highest_risk_asset: str
-    portfolio_pnl_summary: str
-    strategic_advice: str
-
 class PennyStockQualityItem(BaseModel):
     ticker: str
     quality_flag: str   # "ปกติ" / "ระมัดระวังสูง" / "ไม่แน่ใจ"
@@ -201,20 +196,11 @@ if 'active_ticker' not in st.session_state:
     st.session_state.active_ticker = "AAPL"
 if 'ai_debate_result' not in st.session_state:
     st.session_state.ai_debate_result = None
-if 'ai_portfolio_analysis' not in st.session_state:
-    st.session_state.ai_portfolio_analysis = None
 if 'timeframe' not in st.session_state:
     st.session_state.timeframe = "6M (รายวัน)"
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
-# โหลดข้อมูลพอร์ตจากฐานข้อมูลเมื่อเริ่มเปิดหน้าเว็บ (เพื่อการแชร์ข้ามอุปกรณ์)
-if 'port_us' not in st.session_state:
-    st.session_state.port_us = load_portfolio('port_us')
-if 'port_th' not in st.session_state:
-    st.session_state.port_th = load_portfolio('port_th')
-if 'port_crypto' not in st.session_state:
-    st.session_state.port_crypto = load_portfolio('port_crypto')
 
 # รายชื่อแถบวิ่งด้านบนสุด
 TAPE_SYMBOLS = ["NASDAQ:AAPL", "NASDAQ:MSFT", "NASDAQ:NVDA", "NASDAQ:AMZN", "FX:EURUSD", "BITSTAMP:BTCUSD", "CMCMARKETS:GOLD"]
@@ -451,6 +437,82 @@ def fetch_gainers_and_losers(asset_type="US"):
     dummy_l = pd.DataFrame([{"Ticker": "TSLA" if asset_type=="US" else "AOT.BK" if asset_type=="TH" else "ETH-USD", "Price": 172.30, "Change": -3.50}])
     return dummy_g, dummy_l
 
+# ==========================================
+# ⭐ TECHNICAL RATING (Rule-based Strong Buy → Strong Sell)
+# ==========================================
+# เรตติ้งนี้เลียนแบบหลักการ "Technical Rating" ของเว็บอย่าง TradingView/Yahoo คือให้อินดิเคเตอร์
+# หลายตัวโหวต +1 (ฝั่งซื้อ) / -1 (ฝั่งขาย) / 0 (เป็นกลาง) แล้วเฉลี่ยเป็นคะแนน -1.0 ถึง +1.0
+# จากนั้นเทียบช่วงเป็น 5 ระดับ เป็นการวิเคราะห์เชิงเทคนิคเท่านั้น ไม่ใช่คำแนะนำการลงทุน
+RATING_LEVELS = [
+    (0.5, "STRONG_BUY", "ซื้อเด่นชัด", "🟢🟢"),
+    (0.15, "BUY", "ซื้อ", "🟢"),
+    (-0.15, "NEUTRAL", "ถือ/เป็นกลาง", "⚪"),
+    (-0.5, "SELL", "ขาย", "🔴"),
+    (-1.01, "STRONG_SELL", "ขายเด่นชัด", "🔴🔴"),
+]
+
+def compute_technical_rating(c, rsi14, macd_now, macd_prev, ema20_now, ema50_now,
+                             bb_upper, bb_lower, vol_ratio):
+    """
+    คำนวณเรตติ้งเทคนิครวมจากอินดิเคเตอร์หลายตัว คืน dict ที่มี code/label/icon/score/votes
+    - votes: รายละเอียดว่าอินดิเคเตอร์แต่ละตัวโหวตอะไร (เอาไว้โชว์ให้ผู้ใช้เห็นว่าทำไมได้เรตนี้)
+    """
+    votes = []
+
+    # 1) RSI14: <30 oversold = ซื้อ, >70 overbought = ขาย, ช่วงกลางเป็นกลาง
+    if rsi14 < 30:
+        votes.append(("RSI", 1, f"Oversold ({rsi14:.0f})"))
+    elif rsi14 > 70:
+        votes.append(("RSI", -1, f"Overbought ({rsi14:.0f})"))
+    else:
+        votes.append(("RSI", 0, f"กลาง ({rsi14:.0f})"))
+
+    # 2) MACD Histogram: บวก+กำลังยกขึ้น = ซื้อ, ลบ+กำลังกดลง = ขาย
+    if macd_now > 0 and macd_now >= macd_prev:
+        votes.append(("MACD", 1, "บวก & ยกตัวขึ้น"))
+    elif macd_now < 0 and macd_now <= macd_prev:
+        votes.append(("MACD", -1, "ลบ & กดตัวลง"))
+    else:
+        votes.append(("MACD", 0, "ก้ำกึ่ง"))
+
+    # 3) เทรนด์ EMA20 vs EMA50: ราคาเหนือ EMA20 และ EMA20 เหนือ EMA50 = ขาขึ้น
+    if c > ema20_now and ema20_now > ema50_now:
+        votes.append(("Trend", 1, "ขาขึ้น (เหนือ EMA)"))
+    elif c < ema20_now and ema20_now < ema50_now:
+        votes.append(("Trend", -1, "ขาลง (ใต้ EMA)"))
+    else:
+        votes.append(("Trend", 0, "ไซด์เวย์"))
+
+    # 4) ตำแหน่งเทียบ Bollinger Bands: ใกล้ขอบล่าง = ซื้อ, ใกล้ขอบบน = ขาย
+    if bb_upper > bb_lower:
+        bb_pos = (c - bb_lower) / (bb_upper - bb_lower)  # 0=ขอบล่าง, 1=ขอบบน
+        if bb_pos < 0.25:
+            votes.append(("BB", 1, "ใกล้ขอบล่าง"))
+        elif bb_pos > 0.75:
+            votes.append(("BB", -1, "ใกล้ขอบบน"))
+        else:
+            votes.append(("BB", 0, "กลางแบนด์"))
+    else:
+        votes.append(("BB", 0, "-"))
+
+    # 5) Volume: วอลุ่มพุ่ง (>=1.5 เท่า) เสริมน้ำหนักไปทางทิศทางของราคาวันนี้
+    if vol_ratio >= 1.5:
+        if c > ema20_now:
+            votes.append(("Volume", 1, f"พุ่ง x{vol_ratio} หนุนขึ้น"))
+        else:
+            votes.append(("Volume", -1, f"พุ่ง x{vol_ratio} กดลง"))
+    else:
+        votes.append(("Volume", 0, f"ปกติ x{vol_ratio}"))
+
+    score = round(sum(v[1] for v in votes) / len(votes), 3)
+
+    for threshold, code, label, icon in RATING_LEVELS:
+        if score >= threshold:
+            return {"code": code, "label": label, "icon": icon, "score": score, "votes": votes}
+    last = RATING_LEVELS[-1]
+    return {"code": last[1], "label": last[2], "icon": last[3], "score": score, "votes": votes}
+
+
 def scan_market_batch(tickers_list, is_penny=False):
     """
     กวาดสแกนหุ้นทั้งหมดในลิสต์โดยคำนวณสัญญาณมาตรฐานและแท็กกลยุทธ์ Reversal / Take Profit ทั้งระยะสั้นและระยะกลาง
@@ -587,6 +649,13 @@ def scan_market_batch(tickers_list, is_penny=False):
                 if vol_spike:
                     signals.append((f"Volume x{vol_ratio}", "vol"))
 
+                # ⭐ คำนวณเรตติ้งเทคนิครวม (Strong Buy → Strong Sell) จากอินดิเคเตอร์ทั้งชุด
+                rating = compute_technical_rating(
+                    c=c, rsi14=rsi14, macd_now=macd_now, macd_prev=macd_prev,
+                    ema20_now=ema20_now, ema50_now=ema50_now,
+                    bb_upper=u, bb_lower=l, vol_ratio=vol_ratio
+                )
+
                 # บันทึกข้อมูลเฉพาะตัวที่มีแท็กสัญญาณหรือแท็กกลยุทธ์
                 if signals or strategy_tags:
                     results.append({
@@ -597,7 +666,12 @@ def scan_market_batch(tickers_list, is_penny=False):
                         "vol_ratio": vol_ratio,
                         "signals": signals,
                         "strategy_tags": strategy_tags,
-                        "signal_count": len(signals) + len(strategy_tags)
+                        "signal_count": len(signals) + len(strategy_tags),
+                        "rating_code": rating["code"],
+                        "rating_label": rating["label"],
+                        "rating_icon": rating["icon"],
+                        "rating_score": rating["score"],
+                        "rating_votes": rating["votes"],
                     })
             except Exception as e:
                 print(f"Error scanning {ticker}: {e}")
@@ -798,26 +872,6 @@ def run_ai_debate(ticker, ind):
     return {"gemini": gemini_op, "claude": claude_v, "indicators": ind, "ticker": ticker,
             "news_flags": news.get_latest_flags(ticker)}
 
-@st.cache_data(ttl=900)
-def get_ai_portfolio_analysis(portfolio_str):
-    if not GEMINI_API_KEY:
-        return None
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    prompt = f"วิเคราะห์ภาพรวมและการกระจายความเสี่ยงพอร์ตครอบครัวของคู่รัก:\n{portfolio_str}"
-    def run_portfolio():
-        response = client.models.generate_content(
-            model='gemini-3.1-flash-lite',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PortfolioAnalysisResult,
-                temperature=0.3,
-                system_instruction="คุณคือที่ปรึกษาทางการเงิน แนะนำการจัดพอร์ตให้คู่รักปลอดภัย เติบโตมั่นคง ตอบเป็นภาษาไทยทั้งหมดอย่างอบอุ่นและเป็นมิตร ใช้ภาษาพูดง่ายๆ ประโยคสั้น ไม่ใช้ศัพท์การเงินซับซ้อน เหมือนคุยกับเพื่อนสนิท ไม่ใช่รายงานทางการ"
-            )
-        )
-        return json.loads(response.text)
-    return call_api_with_backoff(run_portfolio)
-
 def ask_ai_copilot(query, ticker, price, tech_context, initial_analysis_str, chat_history):
     if not GEMINI_API_KEY:
         return "กรุณาใส่ API Key"
@@ -882,36 +936,31 @@ with st.sidebar:
 # ==========================================
 ticker = st.session_state.active_ticker
 
-# --- 🎯 ตรวจสอบและแปลงสัญลักษณ์ให้เข้ากับ TradingView Widget ---
-tv_symbol = ticker.upper().strip()
-if tv_symbol.endswith(".BK"):
-    tv_symbol = "SET:" + tv_symbol.replace(".BK", "")
-elif "-USD" in tv_symbol:
-    tv_symbol = "CRYPTO:" + tv_symbol.replace("-USD", "USD")
-elif "-" in tv_symbol:
-    tv_symbol = tv_symbol.replace("-", "")
-
-tv_interval = current_tf['tv']
-if tv_symbol.startswith("SET:") and tv_interval in ["1", "5", "15", "60", "240"]:
-    tv_interval = "D"
-    st.toast("⚠️ กราฟหุ้นไทย (SET) แสดงได้เฉพาะ Timeframe รายวัน (D) ขึ้นไป", icon="⏳")
-
 @st.cache_data(ttl=60)
 def get_main_ticker_data(t):
     try:
-        quick_raw = yf.download(t, period="3mo", interval="1d", progress=False)
-        if isinstance(quick_raw.columns, pd.MultiIndex):
-            ticker_df = quick_raw.xs(t, axis=1, level=1) if t in quick_raw.columns.get_level_values(1) else quick_raw.xs(quick_raw.columns.get_level_values(0)[0], axis=1, level=0)
-        else:
-            ticker_df = quick_raw
-            
-        ticker_df = ticker_df.dropna()
+        ticker_df = yf.Ticker(t).history(period="3mo", interval="1d", auto_adjust=False)
+        ticker_df = ticker_df.dropna(subset=["Open", "High", "Low", "Close"])
         if ticker_df.empty:
             raise ValueError("No data returned")
-            
-        current_p = float(ticker_df['Close'].iloc[-1])
-        p_close = float(ticker_df['Close'].iloc[-2]) if len(ticker_df) > 1 else current_p
-        
+
+        # ราคาปิดรายวันล่าสุด ใช้เป็น "ราคาปิดเมื่อวาน" สำหรับคำนวณ % เปลี่ยนแปลง
+        # และเป็น fallback เผื่อดึงราคาอินทราเดย์ไม่สำเร็จ (เช่น ตลาดปิด/เน็ตมีปัญหา)
+        daily_close = float(ticker_df['Close'].iloc[-1])
+        p_close = float(ticker_df['Close'].iloc[-2]) if len(ticker_df) > 1 else daily_close
+
+        # 🔧 แก้บั๊กราคาเก่า: แท่งรายวัน (interval="1d") ของ Yahoo ระหว่างตลาดเปิดอยู่
+        # จะอัปเดตเป็นช่วงๆ ไม่ต่อเนื่อง ทำให้ราคาที่ AI ใช้วิเคราะห์ค้างเก่ากว่าราคาจริงได้มาก
+        # จึงดึงแท่งอินทราเดย์ (1 นาที) มาใช้เป็นราคาปัจจุบันแทน ให้ใกล้เคียงราคาจริงที่สุด
+        current_p = daily_close
+        try:
+            intraday = yf.Ticker(t).history(period="1d", interval="1m", auto_adjust=False)
+            intraday = intraday.dropna(subset=["Close"])
+            if not intraday.empty:
+                current_p = float(intraday['Close'].iloc[-1])
+        except Exception as e:
+            print(f"Intraday price fetch failed for {t}, ใช้ราคาปิดรายวันแทน: {e}")
+
         delta = ticker_df['Close'].diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
         loss = -delta.where(delta < 0, 0).ewm(alpha=1/14, adjust=False).mean()
@@ -942,35 +991,191 @@ def get_main_ticker_data(t):
         st.toast(f"⚠️ ดึงข้อมูลราคาของ {t} ไม่สำเร็จ กำลังใช้ข้อมูลจำลองชั่วคราว", icon="⚠️")
         return 150.00, 0.0, 50.0, 150.0, 155.0, 145.0, 0.0, 1.0 # Dummy fallback
 
+# ==========================================
+# 📈 REALTIME CHART (streamlit-lightweight-charts)
+# ==========================================
+CHART_INDICATOR_OPTIONS = ["EMA20", "EMA50", "SMA20", "Bollinger Bands", "RSI", "MACD", "Volume"]
+
+@st.cache_data(ttl=30)  # cache สั้น 30 วิ เพื่อให้กราฟใกล้เคียงราคาจริงที่สุด แต่ไม่ยิง request ถี่เกินไป
+def get_chart_ohlcv_data(t, period, interval):
+    """ดึงราคา OHLCV สำหรับกราฟ พร้อมคำนวณอินดิเคเตอร์ทั้งชุดไว้ล่วงหน้าเป็น Series ตลอดทั้งกราฟ
+
+    🔧 แก้บั๊ก timestamp=0 (แสดงวันที่ 1 ม.ค. 1970 ทุกแท่ง): เดิมใช้ yf.download() ซึ่งคืน
+    DataFrame แบบ MultiIndex คอลัมน์ที่โครงสร้างเปลี่ยนไปตามเวอร์ชัน yfinance ทำให้บางครั้งดึง
+    index วันที่ผิดคอลัมน์ เปลี่ยนมาใช้ yf.Ticker(t).history() แทน ซึ่งเป็น API ระดับหุ้นเดี่ยว
+    คืนคอลัมน์ปกติ (ไม่มี MultiIndex) พร้อม DatetimeIndex ที่ถูกต้องเสมอ ตัดปัญหาเดาคอลัมน์ทิ้งไปเลย
+    """
+    try:
+        df = yf.Ticker(t).history(period=period, interval=interval, auto_adjust=False)
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if df.empty:
+            return None
+
+        dt_index = df.index
+        if getattr(dt_index, "tz", None) is not None:
+            dt_index = dt_index.tz_convert("UTC").tz_localize(None)
+
+        # ตรวจสอบความสมเหตุสมผลของวันที่ กันไว้เผื่อ index ยังผิดปกติอยู่ (เช่น เป็นตัวเลขล้วน)
+        # จะได้เจอ error ชัดเจนแทนที่จะเงียบแล้วโชว์กราฟวันที่ 1970 แบบเดิม
+        if dt_index.min().year < 2000:
+            raise ValueError(f"วันที่ที่ได้จาก yfinance ผิดปกติ (ปีน้อยกว่า 2000): {dt_index.min()}")
+
+        df = df.reset_index(drop=True)
+        df["time"] = dt_index.astype("datetime64[s]").astype("int64").to_numpy()
+
+        close = df["Close"]
+        df["ema20"] = close.ewm(span=20, adjust=False).mean()
+        df["ema50"] = close.ewm(span=50, adjust=False).mean()
+        df["sma20"] = close.rolling(window=20).mean()
+        bb_std = close.rolling(window=20).std()
+        df["bb_upper"] = df["sma20"] + (bb_std * 2)
+        df["bb_lower"] = df["sma20"] - (bb_std * 2)
+
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+        loss = -delta.where(delta < 0, 0).ewm(alpha=1/14, adjust=False).mean()
+        df["rsi"] = 100 - (100 / (1 + (gain / (loss + 1e-10))))
+
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        df["macd_line"] = ema12 - ema26
+        df["macd_signal"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd_line"] - df["macd_signal"]
+
+        return df
+    except Exception as e:
+        print(f"Chart data fetch error for {t}: {e}")
+        return None
+
+
+def _lw_series(df, col):
+    """แปลงคอลัมน์ DataFrame เป็น list ของจุดข้อมูลสำหรับ Lightweight Charts (ตัด NaN ออก)"""
+    return [{"time": int(t), "value": float(v)} for t, v in zip(df["time"], df[col]) if pd.notna(v)]
+
+
+def render_realtime_chart(t, period, interval, selected_indicators, chart_key_prefix):
+    """วาดกราฟแท่งเทียนเรียลไทม์ (เรียลไทม์แบบ polling ตามรอบรีเฟรช ไม่ใช่ tick สด เพราะ Yahoo Finance
+    เป็นข้อมูลฟรี ไม่ใช่ feed สตรีมมิ่งจริง) พร้อมอินดิเคเตอร์ที่เลือกไว้ และ RSI/MACD แยกเป็นพาเนลด้านล่างถ้าเลือก"""
+    df = get_chart_ohlcv_data(t, period, interval)
+    if df is None or df.empty:
+        st.warning(f"⚠️ ไม่พบข้อมูลกราฟของ {t}")
+        return
+
+    base_chart_options = {
+        "layout": {"background": {"type": "solid", "color": "#0a0c10"}, "textColor": "#d1d4dc"},
+        "grid": {"vertLines": {"color": "rgba(42,46,57,0.4)"}, "horzLines": {"color": "rgba(42,46,57,0.4)"}},
+        "timeScale": {"timeVisible": True, "secondsVisible": False},
+    }
+
+    candle_data = df[["time", "Open", "High", "Low", "Close"]].rename(
+        columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
+    ).to_dict("records")
+
+    price_series = [{
+        "type": "Candlestick",
+        "data": candle_data,
+        "options": {
+            "upColor": "#26a69a", "downColor": "#ef5350", "borderVisible": False,
+            "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
+        },
+    }]
+
+    if "EMA20" in selected_indicators:
+        price_series.append({"type": "Line", "data": _lw_series(df, "ema20"),
+                              "options": {"color": "#f5b942", "lineWidth": 2, "title": "EMA20"}})
+    if "EMA50" in selected_indicators:
+        price_series.append({"type": "Line", "data": _lw_series(df, "ema50"),
+                              "options": {"color": "#38bdf8", "lineWidth": 2, "title": "EMA50"}})
+    if "SMA20" in selected_indicators:
+        price_series.append({"type": "Line", "data": _lw_series(df, "sma20"),
+                              "options": {"color": "#a855f7", "lineWidth": 1, "title": "SMA20"}})
+    if "Bollinger Bands" in selected_indicators:
+        price_series.append({"type": "Line", "data": _lw_series(df, "bb_upper"),
+                              "options": {"color": "rgba(148,163,184,0.6)", "lineWidth": 1, "title": "BB Upper"}})
+        price_series.append({"type": "Line", "data": _lw_series(df, "bb_lower"),
+                              "options": {"color": "rgba(148,163,184,0.6)", "lineWidth": 1, "title": "BB Lower"}})
+
+    if "Volume" in selected_indicators:
+        volume_data = [
+            {"time": int(row["time"]), "value": float(row["Volume"]),
+             "color": "rgba(38,166,154,0.5)" if row["Close"] >= row["Open"] else "rgba(239,83,80,0.5)"}
+            for _, row in df.iterrows()
+        ]
+        price_series.append({
+            "type": "Histogram",
+            "data": volume_data,
+            "options": {
+                "priceFormat": {"type": "volume"},
+                "priceScaleId": ""  # ค่าว่าง = overlay scale แยกต่างหาก ไม่แย่ง scale หลักกับแท่งเทียน
+            },
+            "priceScale": {
+                "scaleMargins": {"top": 0.8, "bottom": 0}  # บีบให้ volume แสดงแค่ 20% ล่างของพาเนล
+            }
+        })
+
+    price_chart_options = {**base_chart_options, "height": 420}
+
+    renderLightweightCharts([{"chart": price_chart_options, "series": price_series}], key=f"{chart_key_prefix}_price")
+
+    if "RSI" in selected_indicators:
+        st.caption("RSI (14)")
+        rsi_series = [{"type": "Line", "data": _lw_series(df, "rsi"),
+                       "options": {"color": "#f5b942", "lineWidth": 2, "title": "RSI(14)"}}]
+        renderLightweightCharts(
+            [{"chart": {**base_chart_options, "height": 130}, "series": rsi_series}],
+            key=f"{chart_key_prefix}_rsi"
+        )
+
+    if "MACD" in selected_indicators:
+        st.caption("MACD (12, 26, 9)")
+        macd_hist_data = [
+            {"time": int(t2), "value": float(v),
+             "color": "rgba(38,166,154,0.7)" if v >= 0 else "rgba(239,83,80,0.7)"}
+            for t2, v in zip(df["time"], df["macd_hist"]) if pd.notna(v)
+        ]
+        macd_series = [
+            {"type": "Histogram", "data": macd_hist_data, "options": {"title": "Histogram"}},
+            {"type": "Line", "data": _lw_series(df, "macd_line"), "options": {"color": "#38bdf8", "lineWidth": 1, "title": "MACD"}},
+            {"type": "Line", "data": _lw_series(df, "macd_signal"), "options": {"color": "#f5b942", "lineWidth": 1, "title": "Signal"}},
+        ]
+        renderLightweightCharts(
+            [{"chart": {**base_chart_options, "height": 150}, "series": macd_series}],
+            key=f"{chart_key_prefix}_macd"
+        )
+
+    st.caption(f"🔄 อัปเดตล่าสุด {datetime.now().strftime('%H:%M:%S')} น. · ข้อมูลจาก Yahoo Finance (ฟรี อาจดีเลย์เล็กน้อย ไม่ใช่ tick สด 100%)")
+
 current_p, change_pct, rsi_v, ma20_v, bb_upper_v, bb_lower_v, macd_hist, vol_ratio = get_main_ticker_data(ticker)
 
-# 1️⃣ MIDDLE SECTION: กราฟ Live TradingView และ สรุปราคาสด
+# 1️⃣ MIDDLE SECTION: กราฟเรียลไทม์ (Lightweight Charts) และ สรุปราคาสด
 col_left_main, col_right_panel = st.columns([3, 1])
 
 with col_left_main:
     st.markdown(f"#### 📈 Live Market Technical Chart: <span style='color:#38bdf8;'>{ticker}</span> ({st.session_state.timeframe})", unsafe_allow_html=True)
-    tradingview_html = f"""
-    <div class="tradingview-widget-container" style="height:380px;width:100%">
-      <div id="tradingview_chart" style="height:100%;width:100%"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-      new TradingView.widget({{
-        "autosize": true,
-        "symbol": "{tv_symbol}",
-        "interval": "{tv_interval}",
-        "timezone": "Asia/Bangkok",
-        "theme": "dark",
-        "style": "1",
-        "locale": "th",
-        "enable_publishing": false,
-        "hide_side_toolbar": false,
-        "studies": ["RSI@tv-basicstudies", "MASimple@tv-basicstudies"],
-        "container_id": "tradingview_chart", "backgroundColor": "#0a0c10", "gridColor": "#232834"
-      }});
-      </script>
-    </div>
-    """
-    components.html(tradingview_html, height=390)
+
+    col_ind_select, col_refresh = st.columns([3, 1])
+    with col_ind_select:
+        selected_chart_indicators = st.multiselect(
+            "เลือกอินดิเคเตอร์ที่จะแสดงบนกราฟ:",
+            CHART_INDICATOR_OPTIONS,
+            default=["EMA20", "Volume"],
+            key="chart_indicators_select"
+        )
+    with col_refresh:
+        chart_refresh_seconds = st.selectbox(
+            "รีเฟรชทุก:", [10, 15, 30, 60], index=1,
+            key="chart_refresh_seconds", format_func=lambda s: f"{s} วิ"
+        )
+
+    @st.fragment(run_every=chart_refresh_seconds)
+    def _live_chart_fragment():
+        render_realtime_chart(
+            ticker, current_tf["period"], current_tf["interval"],
+            selected_chart_indicators,
+            chart_key_prefix=f"chart_{ticker}_{current_tf['interval']}"
+        )
+
+    _live_chart_fragment()
 
 with col_right_panel:
     st.markdown("#### 🔥 ความร้อนแรงรายวัน")
@@ -1016,82 +1221,8 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
     if scan_has_run_key not in st.session_state:
         st.session_state[scan_has_run_key] = False
 
-    col_p, col_s, col_a = st.columns([1.0, 1.7, 0.9])
-    
-    with col_p:
-        st.markdown(f"##### 📋 ตารางพอร์ตครอบครัว ({postfix})")
-        
-        edited_port = st.data_editor(
-            st.session_state[portfolio_key],
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            key=f"editor_{portfolio_key}"
-        )
-        
-        if not edited_port.equals(st.session_state[portfolio_key]):
-            edited_port["Ticker"] = edited_port["Ticker"].apply(
-                lambda x: str(x).strip().upper() if pd.notna(x) else x
-            )
-            st.session_state[portfolio_key] = edited_port
-            save_portfolio(portfolio_key, edited_port)
-            st.toast(f"บันทึกข้อมูลพอร์ต {postfix} ลงฐานข้อมูลแล้ว", icon="💾")
-        
-        if st.button("🔄 อัปเดตราคาสินทรัพย์และ P&L", key=f"btn_calc_{portfolio_key}", use_container_width=True):
-            with st.spinner("กำลังเชื่อมต่อเซิร์ฟเวอร์ตลาด..."):
-                all_tk = edited_port["Ticker"].dropna().tolist()
-                if all_tk:
-                    try:
-                        p_raw = yf.download(" ".join(all_tk), period="1d", interval="1m", progress=False)
-                        updated_rows = []
-                        t_cost, t_value = 0.0, 0.0
-                        
-                        for idx, row in edited_port.iterrows():
-                            try:
-                                tk = row["Ticker"]
-                                shares = float(row["Shares"])
-                                avg_cost = float(row["AvgCost"])
-                                
-                                if len(all_tk) == 1:
-                                    current_m_p = float(p_raw['Close'].iloc[-1])
-                                else:
-                                    if tk in p_raw['Close'].columns:
-                                        current_m_p = float(p_raw['Close'][tk].dropna().iloc[-1])
-                                    else:
-                                        current_m_p = avg_cost
-                                        
-                                val = shares * current_m_p
-                                cost = shares * avg_cost
-                                pnl = val - cost
-                                pnl_pct = (pnl / cost) * 100 if cost > 0 else 0.0
-                                
-                                t_cost += cost
-                                t_value += val
-                                
-                                updated_rows.append({
-                                    "สัญลักษณ์": tk,
-                                    "ถือครอง": f"{shares:,.4f}",
-                                    "ต้นทุน": f"{avg_cost:,.2f}",
-                                    "ราคาตลาด": f"{current_m_p:,.2f}",
-                                    "มูลค่า": f"{val:,.2f}",
-                                    "P&L": f"{pnl:+.2f} ({pnl_pct:+.2f}%)"
-                                })
-                            except Exception as e:
-                                print(f"Error calculating PNL for {row.get('Ticker', 'Unknown')}: {e}")
-                                continue
-                            
-                        st.divider()
-                        total_pnl = t_value - t_cost
-                        total_pnl_pct = (total_pnl / t_cost) * 100 if t_cost > 0 else 0.0
-                        total_color = "#22c55e" if total_pnl >= 0 else "#ef4444"
-                        
-                        st.markdown(f"💰 **ต้นทุนรวม:** {t_cost:,.2f} | **มูลค่าปัจจุบัน:** {t_value:,.2f}")
-                        st.markdown(f"🔥 **กำไรสุทธิ:** <span style='color:{total_color}; font-size:1.15rem; font-weight:bold;'>{total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</span>", unsafe_allow_html=True)
-                        if updated_rows:
-                            st.dataframe(pd.DataFrame(updated_rows), use_container_width=True, hide_index=True)
-                    except Exception as e:
-                        st.error(f"การดึงราคา Real-time ล้มเหลว: {e}")
-                        
+    col_s, col_a = st.columns([1.7, 0.9])
+
     with col_s:
         st.markdown("##### 🔍 ตัวเลือกสแกนตลาดสมองกล")
         scanner_type = st.selectbox("เลือกดัชนีคัดกรองเฉพาะด้าน:", scanner_market_list, key=f"select_scan_{portfolio_key}")
@@ -1141,12 +1272,23 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                 if isinstance(r.get("signals"), list):
                     all_tags.update(label for label, kind in r["signals"])
 
-            f_col1, f_col2 = st.columns([1.2, 1])
+            f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1])
             with f_col1:
                 selected_tag = st.selectbox("🏷️ กรองตามแท็ก/สัญญาณ (ดูเป็นกลุ่มๆ):",
                                              ["ทั้งหมด"] + sorted(all_tags), key=f"tag_filter_{portfolio_key}")
             with f_col2:
-                st.caption("💡 คลิกหัวคอลัมน์ในตารางด้านล่างเพื่อเรียงลำดับได้เลย (เช่น คลิก 'ราคา')")
+                rating_filter = st.selectbox(
+                    "⭐ กรองตามเรตติ้ง AI:",
+                    ["ทั้งหมด", "🟢🟢 ซื้อเด่นชัด", "🟢 ซื้อ", "⚪ ถือ/เป็นกลาง", "🔴 ขาย", "🔴🔴 ขายเด่นชัด"],
+                    key=f"rating_filter_{portfolio_key}"
+                )
+            with f_col3:
+                st.caption("💡 คลิกหัวคอลัมน์ในตารางเพื่อเรียงลำดับได้ (เช่น คลิก 'คะแนน')")
+
+            rating_filter_map = {
+                "🟢🟢 ซื้อเด่นชัด": "STRONG_BUY", "🟢 ซื้อ": "BUY", "⚪ ถือ/เป็นกลาง": "NEUTRAL",
+                "🔴 ขาย": "SELL", "🔴🔴 ขายเด่นชัด": "STRONG_SELL",
+            }
 
             table_rows = []
             for _, r in df_s.iterrows():
@@ -1155,22 +1297,31 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
                 combined_tags = tags_list + sig_list
                 if selected_tag != "ทั้งหมด" and selected_tag not in combined_tags:
                     continue
+                if rating_filter != "ทั้งหมด" and r.get("rating_code") != rating_filter_map.get(rating_filter):
+                    continue
                 change = r.get("change_pct", 0.0)
                 table_rows.append({
                     "ticker": r.get("ticker", r.get("Ticker", "Unknown")),
                     "price": r.get("price", r.get("Price", 0.0)),
                     "change_str": f"🟢 +{change:.2f}%" if change >= 0 else f"🔴 {change:.2f}%",
                     "tags": ", ".join(combined_tags) if combined_tags else "-",
+                    "rating_icon": r.get("rating_icon", ""),
+                    "rating_label": r.get("rating_label", "-"),
+                    "rating_score": r.get("rating_score", 0.0),
                     "quality": r.get("quality_flag", ""),
                     "quality_reason": r.get("quality_reason", ""),
                 })
 
             if not table_rows:
-                st.info('ไม่พบหุ้นที่ตรงกับแท็กที่เลือก ลองเลือก "ทั้งหมด" ดูครับ')
+                st.info('ไม่พบหุ้นที่ตรงกับตัวกรองที่เลือก ลองเลือก "ทั้งหมด" ดูครับ')
             else:
+                # เรียงจากเรตติ้งดีสุด (คะแนนสูงสุด) ไปแย่สุด เป็นค่าเริ่มต้น
+                table_rows.sort(key=lambda x: x["rating_score"], reverse=True)
                 quality_label_map = {"ปกติ": "✅ ปกติ", "ระมัดระวังสูง": "⚠️ ระมัดระวังสูง", "ไม่แน่ใจ": "❔ ไม่แน่ใจ"}
                 display_df = pd.DataFrame([{
                     "หุ้น": row["ticker"],
+                    "เรตติ้ง": f"{row['rating_icon']} {row['rating_label']}",
+                    "คะแนน": row["rating_score"],
                     "ราคา ($)": row["price"],
                     "% เปลี่ยน": row["change_str"],
                     "แท็ก/สัญญาณ": row["tags"],
@@ -1204,11 +1355,8 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
             st.info("💡 ไม่พบสัญญาณตลาด แนะนำกวาดสแกนด้วยตนเอง")
                 
     with col_a:
-        st.markdown("##### 🧠 AI Debate & Portfolio Expert")
-        tab_sub_st, tab_sub_port = st.tabs(["วิเคราะห์โต้ตอบ Debate", "พอร์ตครอบครัว"])
-        
-        with tab_sub_st:
-            st.markdown("""
+        st.markdown("##### 🧠 AI Debate Expert")
+        st.markdown("""
             <div class="vs-banner" style="margin-bottom:10px;">
                 <div class="vs-side vs-gemini" style="padding: 6px 12px;">
                     <div class="vs-label" style="font-size:0.75rem;">◷ GEMINI</div>
@@ -1220,130 +1368,109 @@ def render_portfolio_and_scanner_area(portfolio_key, scanner_market_list, defaul
             </div>
             """, unsafe_allow_html=True)
 
-            # 📰 โชว์ badge ข่าวล่าสุด (จาก DB เดิม ไม่ยิง API ใหม่ ไม่กระทบความเร็วหน้าเว็บ)
-            _news_flags_preview = news.get_latest_flags(ticker)
-            if _news_flags_preview:
-                _sent_icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}
-                _badge_html = " ".join(
-                    f'<span class="pill" title="{f["reasoning"]}">{_sent_icon.get(f["sentiment"], "⚪")} {f["headline"][:40]}{"…" if len(f["headline"]) > 40 else ""}</span>'
-                    for f in _news_flags_preview[:3]
-                )
-                st.markdown(f'<div style="margin-bottom:8px;">{_badge_html}</div>', unsafe_allow_html=True)
+        # 📰 โชว์ badge ข่าวล่าสุด (จาก DB เดิม ไม่ยิง API ใหม่ ไม่กระทบความเร็วหน้าเว็บ)
+        _news_flags_preview = news.get_latest_flags(ticker)
+        if _news_flags_preview:
+            _sent_icon = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}
+            _badge_html = " ".join(
+                f'<span class="pill" title="{f["reasoning"]}">{_sent_icon.get(f["sentiment"], "⚪")} {f["headline"][:40]}{"…" if len(f["headline"]) > 40 else ""}</span>'
+                for f in _news_flags_preview[:3]
+            )
+            st.markdown(f'<div style="margin-bottom:8px;">{_badge_html}</div>', unsafe_allow_html=True)
 
-            if st.button("▶ เริ่มกระบวนการ AI Debate วิจัยด่วน", key=f"btn_ai_st_{portfolio_key}", use_container_width=True, type="primary"):
-                if not GEMINI_API_KEY:
-                    st.error("กรุณากรอก GEMINI_API_KEY ใน secrets")
-                else:
-                    with st.spinner("AI กำลังโต้วาทะประมวลผล (Gemini กำลังร่างความเห็นแรก)..."):
-                        try:
-                            # คำนวณรวบรวม Indicators ดิบ
-                            ind_data = {
-                                "price": current_p,
-                                "change_pct": change_pct,
-                                "rsi": rsi_v,
-                                "ma20": ma20_v,
-                                "bb_upper": bb_upper_v,
-                                "bb_lower": bb_lower_v,
-                                "macd_hist": macd_hist,
-                                "vol_ratio": vol_ratio
-                            }
-                            st.session_state.ai_debate_result = run_ai_debate(ticker, ind_data)
-                            st.session_state.chat_history = []
-                            journal.log_verdict(ticker, st.session_state.ai_debate_result["claude"])  # 📓 บันทึกลง Trade Journal
-                        except Exception as e:
-                            st.error(str(e))
-                            
-            if st.session_state.ai_debate_result:
-                res_deb = st.session_state.ai_debate_result
-                g = res_deb["gemini"]
-                c = res_deb["claude"]
+        if st.button("▶ เริ่มกระบวนการ AI Debate วิจัยด่วน", key=f"btn_ai_st_{portfolio_key}", use_container_width=True, type="primary"):
+            if not GEMINI_API_KEY:
+                st.error("กรุณากรอก GEMINI_API_KEY ใน secrets")
+            else:
+                with st.spinner("AI กำลังโต้วาทะประมวลผล (Gemini กำลังร่างความเห็นแรก)..."):
+                    try:
+                        # คำนวณรวบรวม Indicators ดิบ
+                        ind_data = {
+                            "price": current_p,
+                            "change_pct": change_pct,
+                            "rsi": rsi_v,
+                            "ma20": ma20_v,
+                            "bb_upper": bb_upper_v,
+                            "bb_lower": bb_lower_v,
+                            "macd_hist": macd_hist,
+                            "vol_ratio": vol_ratio
+                        }
+                        st.session_state.ai_debate_result = run_ai_debate(ticker, ind_data)
+                        st.session_state.chat_history = []
+                        journal.log_verdict(ticker, st.session_state.ai_debate_result["claude"])  # 📓 บันทึกลง Trade Journal
+                    except Exception as e:
+                        st.error(str(e))
+                        
+        if st.session_state.ai_debate_result:
+            res_deb = st.session_state.ai_debate_result
+            g = res_deb["gemini"]
+            c = res_deb["claude"]
+            
+            # แถบผลสรุปหลัก
+            signal_upper = c.get("final_signal", "HOLD").upper()
+            banner_class = "buy" if signal_upper == "BUY" else "sell" if signal_upper == "SELL" else "hold"
+            icon = "🟢" if banner_class == "buy" else "🔴" if banner_class == "sell" else "🟡"
+            action_label = {"buy": "ซื้อ (BUY)", "sell": "ขาย (SELL)", "hold": "ถือครอง (HOLD)"}[banner_class]
+
+            st.markdown(f"""
+            <div style="background: linear-gradient(90deg, rgba(201,168,106,0.15), rgba(201,168,106,0.02)); border: 1.5px solid var(--verdict); border-radius: 8px; padding: 10px; margin-bottom:12px;">
+                <div style="font-weight:bold; color:var(--verdict); font-size:0.9rem;">{icon} คำแนะนำสุดท้าย: {action_label}</div>
+                <div style="font-size:0.8rem; color:#cbd5e1; margin-top:4px;">{c.get('action_summary', '')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # สรุปดีเบตจำลองความเห็นย่อย
+            with st.expander("🔍 ดูบทวิพากษ์และข้อท้าทาย (Gemini vs Claude)"):
+                agree_class = "pill-agree" if c.get("agrees_with_gemini") else "pill-disagree"
+                agree_text = "เห็นด้วย" if c.get("agrees_with_gemini") else "ท้าทายแย้งข้อคิดเห็น"
                 
-                # แถบผลสรุปหลัก
-                signal_upper = c.get("final_signal", "HOLD").upper()
-                banner_class = "buy" if signal_upper == "BUY" else "sell" if signal_upper == "SELL" else "hold"
-                icon = "🟢" if banner_class == "buy" else "🔴" if banner_class == "sell" else "🟡"
-                action_label = {"buy": "ซื้อ (BUY)", "sell": "ขาย (SELL)", "hold": "ถือครอง (HOLD)"}[banner_class]
-
                 st.markdown(f"""
-                <div style="background: linear-gradient(90deg, rgba(201,168,106,0.15), rgba(201,168,106,0.02)); border: 1.5px solid var(--verdict); border-radius: 8px; padding: 10px; margin-bottom:12px;">
-                    <div style="font-weight:bold; color:var(--verdict); font-size:0.9rem;">{icon} คำแนะนำสุดท้าย: {action_label}</div>
-                    <div style="font-size:0.8rem; color:#cbd5e1; margin-top:4px;">{c.get('action_summary', '')}</div>
+                <div style="font-size:0.8rem;">
+                    <p><strong style="color:var(--gemini);">Gemini Opinion:</strong> {g.get('market_sentiment', '-')}</p>
+                    <p><strong style="color:var(--claude);">Claude Challenge:</strong> {c.get('challenge_notes', '-')}</p>
+                    <span class="pill {agree_class}">{agree_text}</span>
+                    <span class="pill">ความเสี่ยง: {c.get('risk_level', '-')}</span>
                 </div>
                 """, unsafe_allow_html=True)
-                
-                # สรุปดีเบตจำลองความเห็นย่อย
-                with st.expander("🔍 ดูบทวิพากษ์และข้อท้าทาย (Gemini vs Claude)"):
-                    agree_class = "pill-agree" if c.get("agrees_with_gemini") else "pill-disagree"
-                    agree_text = "เห็นด้วย" if c.get("agrees_with_gemini") else "ท้าทายแย้งข้อคิดเห็น"
-                    
-                    st.markdown(f"""
-                    <div style="font-size:0.8rem;">
-                        <p><strong style="color:var(--gemini);">Gemini Opinion:</strong> {g.get('market_sentiment', '-')}</p>
-                        <p><strong style="color:var(--claude);">Claude Challenge:</strong> {c.get('challenge_notes', '-')}</p>
-                        <span class="pill {agree_class}">{agree_text}</span>
-                        <span class="pill">ความเสี่ยง: {c.get('risk_level', '-')}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # พิกัด Verdict Action Plan
-                signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(signal_upper, "signal-hold")
-                st.markdown(f"""
-                <div class="verdict-box" style="padding:12px; margin-top:8px;">
-                    <div style="font-size:0.75rem; color:var(--verdict); font-weight:bold;">🛡 {c.get('support_zone', '-')} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c.get('resistance_zone', '-')}</div>
-                    <div class="plan-grid" style="margin-top:6px; gap:8px;">
-                        <div class="plan-cell entry" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">จุดเข้าซื้อ</div><div class="plan-value" style="font-size:0.8rem;">{c.get('entry_price', '-')}</div></div>
-                        <div class="plan-cell stop" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Stop Loss</div><div class="plan-value" style="font-size:0.8rem;">{c.get('stop_loss', '-')}</div></div>
-                        <div class="plan-cell target" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Take Profit</div><div class="plan-value" style="font-size:0.8rem;">{c.get('take_profit', '-')}</div></div>
-                    </div>
-                    <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px; line-height:1.3;"><strong>เหตุผลสรุป:</strong> {c.get('final_reasoning', '-')}</div>
-                    <div style="font-size:0.7rem; color:#7b8494; margin-top:4px;">💼 {c.get('position_sizing_note', '-')}</div>
+            
+            # พิกัด Verdict Action Plan
+            signal_class = {"BUY": "signal-buy", "SELL": "signal-sell", "HOLD": "signal-hold"}.get(signal_upper, "signal-hold")
+            st.markdown(f"""
+            <div class="verdict-box" style="padding:12px; margin-top:8px;">
+                <div style="font-size:0.75rem; color:var(--verdict); font-weight:bold;">🛡 {c.get('support_zone', '-')} &nbsp;&nbsp;|&nbsp;&nbsp; 🚀 {c.get('resistance_zone', '-')}</div>
+                <div class="plan-grid" style="margin-top:6px; gap:8px;">
+                    <div class="plan-cell entry" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">จุดเข้าซื้อ</div><div class="plan-value" style="font-size:0.8rem;">{c.get('entry_price', '-')}</div></div>
+                    <div class="plan-cell stop" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Stop Loss</div><div class="plan-value" style="font-size:0.8rem;">{c.get('stop_loss', '-')}</div></div>
+                    <div class="plan-cell target" style="padding:6px 8px;"><div class="plan-label" style="font-size:0.55rem;">Take Profit</div><div class="plan-value" style="font-size:0.8rem;">{c.get('take_profit', '-')}</div></div>
                 </div>
-                """, unsafe_allow_html=True)
-                
-                # ส่วนแชทสืบถามเพิ่มเติมกับ AI Copilot
-                st.divider()
-                st.write("💬 **ถาม-ตอบโต้ตอบ AI Copilot:**")
-                for chat in st.session_state.chat_history:
-                    style_class = "chat-bubble-user" if chat["role"] == "user" else "chat-bubble-ai"
-                    sender = "คุณ" if chat["role"] == "user" else "AI Copilot"
-                    st.markdown(f"""<div class="{style_class}"><strong>{sender}:</strong><br>{chat['content']}</div>""", unsafe_allow_html=True)
-                
-                with st.form(key=f"chat_form_{portfolio_key}", clear_on_submit=True):
-                    user_query = st.text_input("ปรึกษาโมเมนตัมเพิ่มเติม:", key=f"input_query_{portfolio_key}")
-                    if st.form_submit_button("ส่งคำถาม") and user_query:
-                        tech_c = f"RSI={rsi_v:.1f}, MACD_Hist={macd_hist:.4f}"
-                        ai_orig = f"Verdict={c.get('final_signal', '')}, Entry={c.get('entry_price', '')}, TP={c.get('take_profit', '')}"
-                        with st.spinner("AI กำลังวิเคราะห์..."):
-                            copilot_ans = ask_ai_copilot(user_query, ticker, current_p, tech_c, ai_orig, st.session_state.chat_history)
-                        st.session_state.chat_history.extend([
-                            {"role": "user", "content": user_query},
-                            {"role": "copilot", "content": copilot_ans}
-                        ])
-                        st.rerun()
-            else:
-                st.info("💡 กดปุ่มด้านบนเพื่อประมวลผลวิเคราะห์จุดเทรดด้วยระบบ AI Debate")
-                
-        with tab_sub_port:
-            if st.button("🧠 ประเมินความเสี่ยงพอร์ตองค์รวม", key=f"btn_ai_port_{portfolio_key}", use_container_width=True, type="primary"):
-                if not GEMINI_API_KEY:
-                    st.error("กรุณากรอก API_KEY")
-                else:
-                    with st.spinner("AI กำลังประเมินการถ่วงน้ำหนักจัดพอร์ตร่วมกัน..."):
-                        try:
-                            port_str = edited_port.to_string(index=False)
-                            st.session_state.ai_portfolio_analysis = get_ai_portfolio_analysis(port_str)
-                        except Exception as e:
-                            st.error(str(e))
-                            
-            if st.session_state.ai_portfolio_analysis:
-                p_res = st.session_state.ai_portfolio_analysis
-                st.markdown(f"**การกระจายสินทรัพย์:** `{p_res.get('diversification_score', '-')}`")
-                st.markdown(f"**⚠️ ความเสี่ยงสูงสุด:** {p_res.get('highest_risk_asset', '-')}")
-                st.markdown(f"**📝 สรุปภาพรวมพอร์ต:** {p_res.get('portfolio_pnl_summary', '-')}")
-                st.markdown(f"""<div style="background-color: #1e1b29; border-left: 4px solid #a855f7; padding: 10px; border-radius: 6px; font-size: 0.85rem; color: #cbd5e1;"><strong>💡 แนะนำอนาคตพอร์ตครอบครัว:</strong><br>{p_res.get('strategic_advice', '-')}</div>""", unsafe_allow_html=True)
-            else:
-                st.info("💡 คลิกเพื่อประเมินความเสี่ยงพอร์ตร่วมกันของแฟน")
-    
+                <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px; line-height:1.3;"><strong>เหตุผลสรุป:</strong> {c.get('final_reasoning', '-')}</div>
+                <div style="font-size:0.7rem; color:#7b8494; margin-top:4px;">💼 {c.get('position_sizing_note', '-')}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # ส่วนแชทสืบถามเพิ่มเติมกับ AI Copilot
+            st.divider()
+            st.write("💬 **ถาม-ตอบโต้ตอบ AI Copilot:**")
+            for chat in st.session_state.chat_history:
+                style_class = "chat-bubble-user" if chat["role"] == "user" else "chat-bubble-ai"
+                sender = "คุณ" if chat["role"] == "user" else "AI Copilot"
+                st.markdown(f"""<div class="{style_class}"><strong>{sender}:</strong><br>{chat['content']}</div>""", unsafe_allow_html=True)
+            
+            with st.form(key=f"chat_form_{portfolio_key}", clear_on_submit=True):
+                user_query = st.text_input("ปรึกษาโมเมนตัมเพิ่มเติม:", key=f"input_query_{portfolio_key}")
+                if st.form_submit_button("ส่งคำถาม") and user_query:
+                    tech_c = f"RSI={rsi_v:.1f}, MACD_Hist={macd_hist:.4f}"
+                    ai_orig = f"Verdict={c.get('final_signal', '')}, Entry={c.get('entry_price', '')}, TP={c.get('take_profit', '')}"
+                    with st.spinner("AI กำลังวิเคราะห์..."):
+                        copilot_ans = ask_ai_copilot(user_query, ticker, current_p, tech_c, ai_orig, st.session_state.chat_history)
+                    st.session_state.chat_history.extend([
+                        {"role": "user", "content": user_query},
+                        {"role": "copilot", "content": copilot_ans}
+                    ])
+                    st.rerun()
+        else:
+            st.info("💡 กดปุ่มด้านบนเพื่อประมวลผลวิเคราะห์จุดเทรดด้วยระบบ AI Debate")
+
 # ==========================================
 # 📓 TRADE JOURNAL & WIN-RATE TAB
 # ==========================================
@@ -1435,5 +1562,5 @@ with tab_journal_class:
     render_trade_journal_tab()
 
 st.markdown("<div style='text-align:center; color:#7b8494; font-size:0.75rem; margin-top:24px;'>"
-            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ Claude 3.5 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
+            "ข้อมูลนี้ถูกประมวลผลด้วยโมเดลวิเคราะห์เชิงกลยุทธ์ Gemini 3.1 flash lite และ Claude 5 เพื่อใช้เพื่อการศึกษาเทคโนโลยีการเงินเท่านั้น"
             "</div>", unsafe_allow_html=True)
